@@ -102,7 +102,10 @@ SCHEMA_DDL = re.compile(
     r"|ALTER\s+(?:TABLE|DATABASE|SCHEMA)"
     r"|DROP\s+(?:TABLE|DATABASE|SCHEMA|COLUMN|INDEX|VIEW|CONSTRAINT|FOREIGN\s+KEY)"
     r"|RENAME\s+TABLE"
-    r"|TRUNCATE(?:\s+TABLE)?"
+    # TABLE 키워드를 요구한다. 맨몸 TRUNCATE 를 잡으면 Tailwind 클래스
+    # `truncate` 가 걸려 프런트 파일 편집이 전부 막힌다(2026-09-07 4회 실측).
+    # `mysql -e "TRUNCATE t"` 는 검사 2·3의 SQL_DESTRUCTIVE 가 그대로 잡는다.
+    r"|TRUNCATE\s+TABLE"
     r")\b",
     re.IGNORECASE,
 )
