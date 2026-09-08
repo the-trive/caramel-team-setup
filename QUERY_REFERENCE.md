@@ -311,6 +311,7 @@ HAVING COUNT(DISTINCT ua.user_id) >= 5   -- 오탈자성 1~2건 단지 제거
 - ⚠️ **zone 폴리곤이 아예 없는 구가 있다**(중구·광진·양천·동작·관악·종로 등). 그 주소는 최근접 fallback으로 엉뚱한 zone에 떨어진다(예: 중구 신당동 → Z9). **"존 외"로 잡힌 건이 실은 폴리곤 공백 산물일 수 있으니, 존 일치를 목표로 삼기 전에 실거리부터 볼 것.**
 - ⚠️ **반대로 폴리곤이 행정구역을 넘어 과하게 뻗은 경우도 있다.** 실측(2026-07-26): **성남시 중원구 여수동(127.12757, 37.41799)은 `ST_Contains`상 Z16(강동/송파) 단독 포함**이고 Z0(성남)은 미포함(convex hull에만 걸림). ⟹ **성남 예약이 Z16 담당자에게 붙는 것은 시스템상 "정상"**이다. 행정구역명과 zone 이름이 안 맞는다고 곧바로 오배정을 선언하지 말고 `ST_Contains`로 실판정할 것.
 
+- 🛑 **아래 "공동구역은 `zone` 테이블에 없다"는 2026-09-08 체계 전환으로 폐기됐다** — 공용존은 `zone` id 14~19(`kind='CELL_SHARED'`)에 폴리곤으로 들어와 있다. 세대 필터·셀 매핑·셔플 제외는 §3b 존 체계 항목을 볼 것. 아래 문단은 8월 이전 데이터를 볼 때만 유효하다.
 - 🔴 **"공동구역"은 `zone` 테이블에 없다 (2026-08-20).** 셀장 6명 체제의 공동구역(강남·서초 중심에 용산·송파 일부)은 `zone6_areas.geojson`의 `properties.code='BELT'` MultiPolygon이 정본이고, 점-내부 판정을 애플리케이션에서 해야 한다(ray casting, `area` 대신 geojson 좌표 순서 **(lng, lat)**). Z12·Z3·Z5로 근사하면 경계가 달라 물량이 안 맞는다. 같은 파일에 팀존 Z1~Z6·서브존 SZ*도 들어 있어 `zone` 테이블의 Z0~Z17과 **이름이 겹치지만 다른 체계**다 — 섞지 말 것. 팀 배포물에는 없는 파일이라 없으면 요청할 것.
 - 🔴 **세차 "건수"를 영업 대상 "고객 수"로 보고하지 말 것 (2026-08-20 실측).** 기존 고객은 한 달에 여러 번 받으므로 두 숫자가 1.6배 벌어진다. 공동구역 타겟 실측(2026-04~07) = **기존 고객 1인당 월 1.55~1.83건**, 신규는 정의상 1인 1건. 9월 추산도 건수로는 508건인데 사람으로는 **322명**(신규 51 + 기존 271)이었다. "대상이 몇 명이냐"는 질문에 건수를 답하면 영업 물량이 통째로 부풀려진다. ⟹ 모수 질문에는 `COUNT(DISTINCT (월, user_id))`로 세고, **현장 단위까지 환산해 끝낸다**(322명을 디테일러 12명이 20 운영일에 → 1인당 하루 1.5명). ⚠️ 월별 distinct 유저는 월끼리 더하면 중복되니 **월 평균으로 내고 운영일 계수로 보정**할 것.
 - ⚠️ **일평균의 분모는 "실제 세차가 발생한 distinct 날짜"로 세라.** 달력 영업일로 나누면 공휴일·전사 셧다운(2026-07-17 전국 4건)이 분모에 들어가 일평균이 낮게 나온다.
@@ -444,6 +445,7 @@ WHERE r.id=?;
 - ⚠️ **`position` 화이트리스트로 셀 구성원을 뽑지 말 것.** 실측 값 분포(2026-08-17)는 `셀원` 60 · `''`(빈문자) 50 · `교육생` 21 · NULL 9 · `셀장` 8 · `팀장` 1 이라, 흔히 쓰는 `position IN ('셀장','셀원')`은 **교육생·팀장을 조용히 배제한다**(교육생은 장태훈·이순행 셀에 실재). "그 셀장의 사람 전원"이 목적이면 **같은 `cell_name`만** 걸어라. 빈문자·NULL row는 `cell_name`이 없어 어차피 안 붙는다.
 - 파견 셀(오토랩·헤이딜러·인천테슬라 등)은 region이 Z코드가 아닌 텍스트.
 - 🔴 **셀장 정본이 둘이다 (2026-09-04).** 위 `supply_sheet.position='셀장'`은 HR 로스터 기준이고, **앱·zero-api가 쓰는 셀장 권한(`/v1/detailer/me`의 `cellAdminAvailable`, 셀 스케줄 화면, 동행·컨시어지 지정)은 `cell_membership` 테이블만 본다.** 판정 = `role='LEADER' AND deleted_at IS NULL AND effective_from <= UTC_TIMESTAMP() AND (effective_to IS NULL OR effective_to > UTC_TIMESTAMP())` (from 포함·to 미포함, UTC 저장). prod에는 셀 6개(`cell.code` Z1~Z6)·멤버십 50행이 **2026-09-08 00:00 KST부터 유효**하게 들어가 있다 — 그 전엔 활성 LEADER 0이라 "앱 셀장 없음"이 정답이다. "앱에서 셀장 메뉴가 안 보인다"는 이 테이블을, "누가 셀장인가(인사)"는 supply_sheet를 봐라. 두 결과가 다르면 둘 다 맞을 수 있다.
+- ⚠️ **`role='LEADER'`로 먼저 거르면 옛 셀장이 섞인다 (2026-09-08).** `cell_membership`은 겹치는 행을 DB가 막지 못해 **한 사람에게 동시에 유효한 행이 여러 개** 있을 수 있다. 서버 판정은 항상 **그 사람의 최신 행 하나**(`effective_from DESC, id DESC`)를 먼저 고르고 그 행의 role을 본다 — 옛 LEADER 행이 안 닫힌 채 남아 있고 최신 행이 MEMBER면 그 사람은 셀장이 아니다. 셀장 목록을 뽑을 땐 `role` 필터를 **SQL이 아니라 최신 행을 고른 뒤에** 걸어라. 같은 시점 두 셀에 동시 소속이면 서버는 **소속 없음으로 fail-closed**한다(어느 셀 scope도 주지 않음). role 텍스트는 대소문자·공백 무시 collation이라 `'leader '`도 필터를 통과한다 — 값 비교 전에 trim+upper.
 - ⚠️ **`cell.code` Z1~Z6은 `zone` 테이블의 Z1~Z6과 이름만 같은 다른 축**(§위 BELT 경고와 같은 함정). 셀↔존 매핑은 `zone_cell_assignment`(effective-dated, 셀당 zone 3개·공용 zone은 셀 2개)로 따라가고, `cell_name`·`region`으로 재구성하지 말 것. 셀장의 그날 동행 셀원은 `cell_accompaniment`(service_date KST, deleted_at NULL).
 
 **디테일러 로그인 정체성 = `detailer.user_id → app_user`**:
@@ -497,7 +499,18 @@ JOIN zone z ON z.id = r.zone_id     -- ⚠️ service_zone 테이블 없음 — 
 | 24 | Z5 동남 |
 | 25 | Z6 경기남부 |
 
-🔴🔴 **존 체계가 두 벌 겹쳐 있고, 좌표 하나가 항상 존 2개에 들어간다 (2026-09-04 실측).** 옛 Z-존(id 1~13, 이름 `Zn (구/구)`)과 9월 조직개편 체계(id 14~19 `CELL_SHARED Pn` + id 20~25 `Zn 지역명`)가 서울을 **각각 독립적으로 타일링**한다. `ST_Contains`는 그래서 언제나 2행을 돌려준다 — 방배동 → `5:Z5 (서초구/용산구)` + `14:CELL_SHARED P0` / 천호 → `12:Z16 (강동구/송파구)` + `24:Z5 동남` / 옥수동 → `8:Z9` + `18:CELL_SHARED P4`.
+🔴🔴 **존 체계가 두 벌 겹쳐 있어, 세대 필터 없이 `ST_Contains`를 쓰면 좌표 하나가 존 여러 개에 들어간다 (2026-09-04 실측).** 옛 Z-존(id 1~13, 이름 `Zn (구/구)`)과 9월 조직개편 체계(id 14~19 `CELL_SHARED Pn` + id 20~25 `Zn 지역명`)가 서울을 **각각 독립적으로 타일링**한다 — 방배동 → `5:Z5 (서초구/용산구)` + `14:CELL_SHARED P0` / 천호 → `12:Z16 (강동구/송파구)` + `24:Z5 동남` / 옥수동 → `8:Z9` + `18:CELL_SHARED P4`.
+- 🔴 **`zone` 자체에 세대가 있다 — 조인에 유효일자를 걸면 좌표당 1행으로 정리된다 (2026-09-07 실측).** `zone`에 `effective_from`·`effective_to`·`kind`·`group_code` 컬럼이 있다. 구존 13개는 `effective_to = 2026-09-07 15:00:00`(UTC), 신존 12개는 같은 값이 `effective_from`이다.
+  ```sql
+  LEFT JOIN zone z ON z.deleted_at IS NULL
+    AND z.effective_from <= :date AND (z.effective_to IS NULL OR z.effective_to > :date)
+    AND ST_Contains(z.area, ST_GeomFromText(CONCAT('POINT(',ua.longitude,' ',ua.latitude,')'),0))
+  ```
+  실측(2026-09-08 기준 예약 주소 693개): **1행 684 · 0행 8 · 2행 1**. ⟹ "룰 분포로 어느 체계가 사는지 역추적"하는 아래 우회는 이제 보조 확인용이다.
+- ⚠️ **세대 필터를 안 걸었을 때 "항상 2행"은 아니다** — 구세대에 없던 지역은 1행(예 `25:Z6 경기남부`), 신구 경계가 겹치면 3행, 폴리곤 밖은 0행이다. 신세대끼리 겹치는 좌표도 1건 있다(주소 45440 → `20:Z1 강북서·고양` + `21:Z2 강북동·도심`) — `LIMIT 1`로 집으면 조용히 갈린다.
+- **존↔셀 매핑 = `zone_cell_assignment`**(zone_id, cell_id, effective_from/to, deleted_at) + `cell.code`(Z1~Z6). 전담존(`kind='CELL_EXCLUSIVE'`, id 20~25)은 셀 1:1이라 존 게이트가 셀 게이트 구실을 하고, **공용존(`kind='CELL_SHARED'`, id 14~19)은 셀 2개가 나눠 맡는다**(P0=Z3·Z4, P1=Z3·Z6, P2=Z5·Z6, P3=Z2·Z5, P4=Z1·Z2, P5=Z1·Z4).
+- 🔴 **셔플은 공용존 예약을 아예 건드리지 않는다 (caramel-api, 2026-09-05 prod).** `route-optimization.service.ts`가 `zoneKind='CELL_SHARED'`인 예약을 대상에서 뺀다 — 옮기지도, 교환으로 받지도 않는다(공용 조각을 누가 맡을 자격이 있는지가 그 레포에 없어서 내린 보수 조치). 물량이 작지 않다: 2026-09-08~11 CONFIRMED **185/732건 = 25.3%**. "셔플이 이 예약을 왜 안 옮겼나"의 첫 확인 항목.
+- 🔴 **룰의 `zone_id`가 구세대면 그 디테일러는 신세대 예약과 절대 매칭되지 않는다** — 셔플에서는 내보내기만 되고 **수신 0**이 된다. 실측(2026-09-08): 셀장 6명(21·80·87·97·114·161)이 `cell_membership`엔 LEADER로 들어갔는데 근무 룰 zone_id는 여전히 2·3·5·6·7·10·12였다. 사람별 존을 볼 때 **룰의 zone_id 세대와 대상 날짜의 세대를 대조**할 것.
 - 🔴🔴 **전환 시점은 2026-09-08 00:00 KST다 — 그 이전 날짜엔 아래 "새 체계를 써라"가 정반대로 틀린다 (2026-09-06 실측).** 새 zone_id(20~25)를 쓰는 `detailer_work_schedule`은 `effective_from = 2026-09-07 15:00:00`(UTC)부터 시작한다. **2026-09-07(월) 유효 룰의 담당자 분포는 옛 Z-존이 전부**다 — `zone_id` 8(Z9) 8명 · 2(Z1) 6명 · 10(Z12) 6명 · 5·9 각 5명이고 **id 20~25는 0명**. 하루 뒤인 09-08(화)엔 반대로 뒤집힌다. ⟹ **존 id를 고르기 전에 대상 날짜의 effective 룰로 `GROUP BY zone_id` 를 한 번 돌려 어느 체계가 살아 있는지 확인할 것.** 스케줄은 주 단위로 새 row가 나므로(§3b) 날짜 경계 하나 차이로 후보가 통째로 0명이 된다.
 - 🔴 **후보 탐색에 쓸 것은 새 체계(id ≥ 14)다** (위 전환 시점 이후 한정). 활성 DEFAULT 룰의 담당자 분포(2026-09-08 유효 기준)로 보면 새 체계는 존당 **4~6명**인데 **옛 Z-존은 전부 존당 1명**(Z1·Z3·Z5·Z6·Z7·Z9·Z12·Z16 각 1명)뿐인 잔존 껍데기다. ⟹ 옛 Z-존 id로 대체 후보를 뽑으면 **1명 나오고 그 1명이 휴무면 "후보 없음"으로 오답**한다(2026-09-04 천호 재배정에서 실제로 발생 — Z5·Z9·Z10·Z12로 7건을 찾았을 때 전원 휴무/0명이었고, 같은 좌표를 `CELL_SHARED`로 다시 찾자 후보가 나왔다).
 - ⚠️ **이름이 겹친다.** `Z5`가 id 5(`Z5 (서초구/용산구)`)와 id 24(`Z5 동남`) 둘, `Z3`·`Z6`도 마찬가지다. **사람에게 말할 때도 `zone.name`을 통째로 인용**하고 "Z5"로 줄이지 말 것.
@@ -571,6 +584,12 @@ GROUP BY s.detailer_id, d.name ORDER BY min_km;
 ### 3e. 디테일러 생산성 — 작업 소요시간·이동 간격 (2026-08-06 실측)
 
 "1인당 하루 몇 대까지 가능한가"를 따질 때 쓰는 3종. 세 군데 다 함정이 있다.
+
+🔴 **계획 소요분(`estimated_time`)의 산식은 `service.time_required`가 아니다 (2026-09-07 코드 확정, `derive-wash-duration.policy.ts`).** `service_group_id`가 1·2·3·7이면 **코드 상수 60·50·30·60**이 쓰이고 그 서비스 행의 `time_required`(예: `프리미엄 세차 패키지 올클린 케어` 70)는 **무시된다**. 여기에 `user_option`→`options.extra_time` 합(왁스 15·살균 15 등) + `car_tier.tier >= 5`면 +10 + 첫 세차면 +10을 더한다. ⟹ DB의 `time_required`로 소요분을 재구성하면 값이 안 맞는다. 그룹이 위 4개에 없을 때만 `time_required`가 쓰인다.
+
+🔴 **컨시어지 케어 예약은 위 산식 위에 최소값(floor)이 얹힌다 (2026-09-08 코드 확정, `concierge-care-duration.policy.ts`).** 활성 케어 marker가 그 예약의 **현재 담당자와 일치할 때만** 산식값을 **외부만 100분 / 내부까지 140분**으로 끌어올린다(산식값이 이미 더 크면 그대로). 판정 입력은 서비스 묶음이 아니라 **실제로 내부까지 하는가** — 원래 묶음이 외부+내부거나 `내부 세차 추가` 옵션이 붙으면 140분이다. 내부만·미지 묶음엔 floor가 없다. ⟹ 케어 예약 소요분을 §3e 산식만으로 재구성하면 안 맞는다.
+
+🔴 **케어 지정은 예약의 세차권 서비스를 `컨시어지 케어 체험`(service 145, `service_group_id=1` = 외부+내부)으로 갈아치운다. 원래 상품은 `user_service`에 남지 않는다 (2026-09-08 실측).** 모니터링을 위한 의도된 교체다. 그래서 케어 예약에 `JOIN service`로 세차 범위를 읽으면 **전부 외부+내부로 나온다** — prod 18건 중 12건이 원래 외부만인데 그렇게 보인다. 원래 상품의 정본은 `reservation_change_log`의 `JSON_EXTRACT(data,'$.type') = 'CONCIERGE_CARE_SERVICE_CLASSIFICATION_CHANGED'` → `$.fromServiceId`(전 기간 커버, 예약별 첫 로그가 원본)다. "케어 예약의 세차 범위 비중"을 물으면 `service`가 아니라 이걸 봐라. ⏭️ `reservation_metadata` `key='concierge_care_origin_service'`(JSON `serviceId`·`serviceGroupId`·`serviceName`·`timeRequired`)가 같은 값을 담을 예정 — 코드가 머지되면 신규 지정분부터 생기고 기존 18건은 위 로그에서 소급 생성한다. 그때까지는 로그가 유일한 소스다.
 
 🔴 **실제 작업 소요시간의 정본은 `wash_result.created_at` → `wash_result.finished_at`이다. `reservation.estimated_time`을 쓰지 마라** — 그건 차량 티어·서비스에서 나온 **산식(계획값)**이지 측정값이 아니다. 부하 랭킹(§6b)엔 계획값이 맞지만 "실제로 몇 분 걸리나"엔 틀린다.
 
@@ -1005,8 +1024,13 @@ JOIN entitlement_package_instance epi ON epi.id = epit.package_instance_id
 ### 5d. 구독 status=ACTIVE 필터
 
 - `status='ACTIVE'` 단독 조건은 일시정지 포함 → "현재 세차 가능한 활성 구독자" 집계 시 왜곡
-- **실사용 구독자(일시정지 제외)**: `status='ACTIVE' AND paused_at IS NULL`
-- `status='ACTIVE' AND paused_at IS NOT NULL` = 일시정지 상태 (세차 불가, 구독료 정지)
+- **실사용 구독자(일시정지 제외)**: `status='ACTIVE' AND paused_at IS NULL` — 단 아래 함정 때문에 **과소집계**다.
+
+🔴 **`paused_at`은 "지금 정지 중"이 아니라 "마지막으로 정지를 걸었던 시점"이다 (2026-09-08 실측).** 재개해도 NULL로 되돌아가지 않는다 — api `pause-subscription.handler`는 status를 ACTIVE로 두고 `paused_at=now` + `ended_at`을 정지기간만큼 미는 것이 전부이고, **`paused_at`을 지우는 코드 경로가 리포 전체에 없다.** 정지기간을 담는 컬럼도 없어서(`period`는 구독 주기다) **"정지가 끝났는지"는 구독 행만 봐서는 알 수 없다.**
+- 실측: `status='ACTIVE' AND paused_at IS NOT NULL` **289건 중 80건(27.7%)** 이 `paused_at` 이후 그 구독으로 세차권이 발급됐다 = **이미 재개됐다.** 정지 중이면 세차권이 안 나간다.
+- ⟹ `paused_at IS NOT NULL`을 "일시정지 중"으로 세면 **최소 27.7% 과대**, `paused_at IS NULL`을 "실사용"으로 세면 그만큼 **과소**다.
+- 재개 판별이 필요하면 발급으로 본다: `NOT EXISTS (SELECT 1 FROM user_service us WHERE us.subscription_id=s.id AND us.created_at > s.paused_at)` 인 것만 정지 중 후보.
+- ⚠️ `paused_at`이 오래됐다는 것만으로는 재개 근거가 못 된다 — 장기 정지도 같은 모습이다(90일 기준으로 갈랐을 때 22건뿐이었고, 발급 기준으로는 80건이었다).
 
 **⚠️ stopped_at·churn 판정 함정**
 - `stopped_at` = 해지 시점 (churn 판정 컬럼). **STOPPED 4,500건+도 `deleted_yn=0`** → deleted_yn만으로 활성 판단하면 해지 구독이 오염된다. 활성 = `status='ACTIVE' AND deleted_yn=0`.
@@ -1310,6 +1334,9 @@ JOIN reservation_draft d
   - `D3초과%` = `days_to_first_slot >= 3 OR IS NULL` 비율
   - 요청 단위는 세션이 아니라 `(user_id, address_id, 요청일 KST)` **dedup 후** 세야 한다(한 번 보면 로그가 3~5건씩 쌓인다).
 - 🔴 **슬롯 노출 ≠ 예약 가능. `duration`은 "그 조회가 가정한 세차 시간"일 뿐 실제 소요시간이 아니다 (2026-08-10 콜 콘솔 409 조사).** 어드민 콜 콘솔·워크인·반얀 발렛은 `fallbackDurationMinutes: 60` 고정으로 조회한다(차량·세차권 컨텍스트 미전달) → 로그 `duration=60`. 반면 예약 확정은 실제 `reservation.estimated_time`(외부+내부 90분 등)으로 겹침을 검사하므로, **60분엔 들어가고 90분엔 안 들어가는 슬롯이 노출된 뒤 확정에서 409 '이미 같은 시간대에 배정된 예약이 있습니다'로 튕긴다.** 슬롯 로그로 "자리 있었다"를 판정할 때 duration을 확인하지 않으면 오독한다.
+- 🔴🔴 **하루 마지막 칸은 노출되지만 확정에서 튕긴다 — 슬롯 생성과 확정 검사가 근무창을 다르게 본다 (2026-09-07 코드+prod 확정).** 슬롯 생성(`generate-time-slots.policy.ts`)은 **시작 시각만** FREE 블록 안이면 칸을 만들고 끝 시각이 근무창을 넘는지는 안 본다. 반면 셀 배정 경로의 확정 검사(`prisma-scheduling-assignment-validator.repository.ts` → `findScheduledDetailerIds`)는 `근무시작 <= 시작 && 끝 <= 근무종료`를 요구한다. ⟹ **근무 10:00~19:00인 사람의 18:00 칸은 정확히 60분인 세차만 통과**하고, 옵션 하나만 붙어도(외부+내부 60+옵션 30=90분 → 19:30 종료) 목록엔 뜬 채 '선택한 시간은 예약할 수 없습니다.'로 거부된다. 08:00~17:00 조는 16:00 칸이 같은 문제. 실측(2026-09-09 유효 DEFAULT 스케줄): 종료 19:00 **39명** · 17:00 **12명**.
+  - 이 끝시각 검사는 **셀 배정 경로에만** 있고 그 경로는 **예약 날짜가 2026-09-08 00:00 KST 이후일 때만** 켜진다(`COMMON_ZONE_RUNTIME_CUTOFF`). 그 전 날짜는 옛 경로로 가고 옛 경로는 예약 겹침만 봐서 근무창 초과를 허용했다 → **"어제까진 되던 18시가 오늘부터 안 된다"의 원인.**
+  - 재현: `GET /v1/scheduling/detailers/available-at?addressId=..&startAt=..&durationMinutes=..`를 60과 실제 소요분 두 값으로 쳐서 `NO_FREE_INTERVAL`이 갈리는지 본다. 무인증.
 - 🔑 **"같은 시각인데 어떤 땐 되고 어떤 땐 안 된다"의 재구성 정본 = `time_slot_result_log.detailer_id`.** 같은 주소·같은 시각이라도 **조회할 때마다 묶이는 디테일러가 바뀐다**(실측: 8/12 08:00이 17:04 조회 한수용 → 17:08 조회 정순욱). 겹침 검사는 **디테일러 축**이므로 결과가 갈린다. 조사 순서 = ①`time_slot_request_log`에서 해당 시각대 요청 찾기 ②`result_log`에서 문제 슬롯의 `detailer_id` 확인 ③그 디테일러의 같은 날 예약과 `estimated_time`으로 겹침 재현. `reservation`만 봐서는 "왜 실패했는지"가 안 나온다(실패는 롤백돼 흔적이 없다).
 - 존 배정은 `address_id → user_address` 좌표 → `ST_Contains`(§2f). `zone_id` 컬럼은 커버가 75%라 전 기간 분석엔 좌표 판정이 안전.
 - **어드민 화면이 이미 있다**: `/admin/map` = 슬롯 수요 지도(날짜별 존별 요청 수 + 근무 디테일러 수 + 폴리곤). zero PR #577, 2026-06-18 배포. 존 수급 질문에 새 도구를 만들기 전에 이걸 먼저 볼 것.
@@ -1711,6 +1738,11 @@ CRM·트랜잭션 메시지 발송 기록 테이블.
 - ⚠️ **"통화 수 적다" ≠ 장애**: 예약 중 050 통화가 잡히는 비율은 **30~45%가 정상 밴드**. 디테일러 절반가량은 앱 050 발신을 안 씀(문자 사용 — SMS는 시스템 미캡처 / 저장된 실번호 직발신). 19시 KST 통화 스파이크(일요일 포함)는 D-1 저녁 사전 확인콜로 정상.
 - **`customer_vno`**: 고객에게 050 동적 부여. **user_id 단위 키잉(폰번호 아님)** — 한 폰이 여러 app_user면 특정 user_id에만 붙음. 통화↔vno 매칭 구간 = `[assigned_at, COALESCE(cleared_at, expires_at)]`. ⚠️ `ASSIGN_FAILED` 대량(수십 건/일) = 더미폰 유저(01012345678류) 매시 재시도 반복이지 시스템 장애 아님 — `COUNT(DISTINCT user_id)`로 먼저 확인.
 - 🔴 **`customer_vno`에 050 번호 문자열이 없다** — `SELECT vno FROM customer_vno`는 `Unknown column`. 번호는 `vno_pool_id` FK로 **`vno_pool`(id·vno·status)** 을 조인해야 나온다(prod 전수: 번호 문자열 컬럼 `vno`를 가진 테이블은 `vno_pool`·`telephony_call_log`·`detailer` 셋뿐이고, **`detailer.vno`는 폐기된 "디테일러 고정 부여" 설계의 잔재로 전부 NULL**(163/163, 2026-08-21) — 고객 050을 찾다가 여기 조인하면 빈 결과가 난다). 배정 현황 표준형: `FROM customer_vno cv LEFT JOIN vno_pool p ON p.id = cv.vno_pool_id`. 현재 유효 배정 = `cv.status='ASSIGNED'`(과거 시점 커버리지엔 쓰지 말 것 — 현재상태 컬럼이라 회수된 과거 건이 전부 0으로 보인다. 과거는 `assigned_at`/`cleared_at` 구간으로).
+- 🔴 **"이 예약에 050이 붙었나" 커버리지 판정은 `status='ASSIGNED'`와 `expires_at > UTC_TIMESTAMP()`를 둘 다 걸어야 한다** (2026-09-08 실측). 앱이 실제 통화에 050을 쓰는 조건이 이 둘이다(zero-api `findActiveCustomerVnos`). 회수 크론(`telephonyClearCustomerVno`)이 매시 정각에만 돌아 만료됐는데 `ASSIGNED`로 남은 행이 최대 1시간 존재하므로 status만 보면 과다 카운트. ⚠️ **여기서 `NOW()`를 쓰면 안 된다** — `expires_at`은 UTC 저장, `NOW()`는 KST라 9시간 어긋난다(§5a). 실제로 `expires_at > NOW()` + `reservation_datetime >= CURDATE()`로 세서 "162건 중 2건 누락"이라는 오답이 나왔고, `UTC_TIMESTAMP()`와 KST 일자 창(`CURDATE()-9h ~ +15h`)으로 고치니 **153건 전건 배정**이었다. 표준형:
+  ```sql
+  LEFT JOIN customer_vno cv ON cv.user_id = r.user_id
+    AND cv.status = 'ASSIGNED' AND cv.expires_at > UTC_TIMESTAMP()
+  ```
 - **크론 실행 기록 = `job_execution`**(`job_id`→`job.name`, telephony 크론 8종). ⚠️ **status='FAILED'여도 장애 단정 금지** — 유저 1명 실패해도 execution 전체가 FAILED로 기록됨. `result` JSON의 `failureCount`/`successCount`를 먼저 볼 것.
 - 🔴 **`job_execution.status='SUCCESS'`도 "그 크론이 일했다"의 근거가 아니다 (2026-08-31 실측).** 핸들러가 내부 실패를 `warn` 로그로만 삼키면 실행은 SUCCESS로 남는다(`sweepUnjudged` 실사례 — 며칠간 아무도 못 봤다). **일했는지는 산출물 테이블에서 센다**: 그 크론이 쓰는 행의 `created_at`을 KST 시(hour)로 잘라 크론 시각대에 몇 건이 쓰였는지 본다. 예 — 20시 크론이면 `SUM(HOUR(CONVERT_TZ(created_at,'+00:00','+09:00'))=20)`. 이걸로 "SUCCESS인데 0건"과 "정상"이 갈린다.
 - 🔴 **같은 크론 이름·같은 `job_id` 를 zero-api 와 레거시 caramel-api 가 공유한다 — `job_execution` 만 보면 어느 쪽이 보냈는지 못 가른다 (2026-09-01 실측).** 발신 주체 판정 2단계: ① **`job.metrics.source`** 가 채워져 있으면 zero-api(파일 경로가 들어온다), **NULL 이면 레거시**. ② charts 레포 **`caramel-api-cron/values-prod.yaml`** 에서 그 이름을 찾는다 — `defaults.suspend: true` 라서 **항목에 `suspend: false` 가 없으면 zero 쪽은 안 돈다**(2026-09-01 기준 리마인더 중 `dMinus2WashReminder` 만 활성, `beforeWashReminder`·`dDayWashReminder`·`reservationReminder`·`parkingInfoReminder` 는 suspend). 레거시 스케줄은 데코레이터에 박혀 있다(`apps/batch/src/messaging/messaging.service.ts` 의 `@Cron(CronExpression.EVERY_DAY_AT_6PM)` 등) — `job.cron_time` 은 레거시 행에선 한글 문구("매일 20시")까지 섞인 **참고값**이라 믿을 게 아니다.
@@ -1841,6 +1873,7 @@ JOIN car c ON c.id = rc.car_id AND c.deleted_yn = 0
 ```
 
 **생성 경로·영업자 귀속 = `reservation_metadata`(`reservation_id` + `key` + JSON `value`) (2026-08-14 실측)**
+- ⚠️ **한 예약에 key가 여러 개 공존한다 — `reservation_id`만으로 조회하면 엉뚱한 행이 섞인다 (2026-09-08 실측).** active 행 분포: `__platform__` 30,573 · `timeSlotRequestId` 17,873 · `admin/call` 424 · `banyan/strategy` 239 · `partner`·`partnerReason` 각 189 · `concierge_care` 100 · `flow` 19 · `concierge-care-sales/strategy` 11. 항상 `key=` + **`deleted_at IS NULL`**을 함께 걸 것 — 소프트 삭제라 해제된 marker가 행으로 남아 있다.
 - `key='admin/walk-in'` = 현장접수(워크인), `key='admin/call'` = 콜콘솔 컨시어지, 둘 다 없으면 고객앱. **워크인만 세면 콜콘솔분이 통째로 빠진다.**
 - 워크인 value JSON에 **`intakeChannel`**(`FIELD_SALES`/발렛/직접방문) + **`fieldSalesDetailerId`·`fieldSalesDetailerName`** = 현장영업 실제 영업자. 접수 계정(`sales.partnerId`)은 반얀 공용 `오퍼레이터`라 영업자 특정에 못 쓴다 — **"누가 팔았나"는 이 필드가 정본**.
 - `key='partner'` / `key='partnerReason'` = 제휴처·VIP 예약 판정 결과(라벨과 판정 근거). **제휴 예약을 세는 정본이 여기다** — 쿠폰·utm으로 역산하면 판정 규칙과 어긋난다. 예약 생성 시점에 쓰이는 게 원칙이고, 구독 자동예약처럼 생성 이펙트를 안 타는 건은 세차 **D-1 20시 크론**(`partnerVipDailyDigest`)이 사후에 채운다 ⟹ 두 시각대가 섞여 있는 게 정상이다.
@@ -1934,6 +1967,7 @@ JOIN car c ON c.id = rc.car_id AND c.deleted_yn = 0
 | `DETAILER` | `ASSISTED_BOOKING` | 예약 잡기 계열만 (**반얀 보드 접근 불가**) |
 
 - 🔴 **2026-08-17, 공용 계정(`operator` = partner 41, `detailer1`·`detailer2`)이 전부 `deleted_yn=1`로 정지되고 현장 인원이 개인 `MASTER_DETAILER` 계정으로 전환됐다**(username = 본인 휴대폰번호). ⟹ **allowlist에 없는 엔드포인트가 그 순간부터 전부 403**이 된다. 현장에서 "저장이 안 된다"고 오면 코드·배포보다 **먼저 `partner.role`을 조회**할 것(실사례: 반얀 판매 작전 저장 403, PR #1606).
+- 🔴 **디테일러도 어드민 권한 행을 갖는다 — "어드민 권한자"를 `partner`만 보고 세지 말 것 (2026-09-08 실측).** 지금 권한 판정의 정본은 role 표가 아니라 **`admin_partner_permission`**(`partner_id·resource·action`)이고, 가드는 그 행만 본다 — **`role='admin'`인지는 확인하지 않는다.** 게다가 `AdminPartnerJwtGuard`는 디테일러앱 토큰도 partner로 해석하므로(`partner.detailer_id` 연결) **디테일러가 어드민 API에 도달할 수 있다.** prod에 `detailer_id IS NOT NULL`인 partner가 72행이고 그중 여럿이 `SCHEDULE` 등 권한 행을 갖고 있다(셀장 본인 포함). 조회: `SELECT p.id,p.detailer_id,app.resource,app.action FROM partner p JOIN admin_partner_permission app ON app.partner_id=p.id`.
 - ⚠️ **권한 변경은 재로그인해야 적용된다** — capability가 JWT 발급 시점에 박히므로 `role`만 UPDATE하면 기존 토큰은 그대로다.
 - 옛 서술 정정: "반얀 현장은 공용 오퍼레이터 계정이라 개인 특정 불가"는 **2026-08-17부터 성립하지 않는다** — `crm_note.partner_id`·`partner_activity_log.partner_id`로 개인이 특정된다.
 
@@ -1944,12 +1978,12 @@ JOIN car c ON c.id = rc.car_id AND c.deleted_yn = 0
 |------|------|------|
 | id | int | PK |
 | user_id | int | FK → app_user.id |
-| status | varchar(25) | `ACTIVE`/`STOPPED`/`CREATED`/`ENDED`/NULL (오타 `STOPPPED` 소량). ⚠️`PAUSED` 없음 — 일시정지는 paused_at |
+| status | varchar(25) | `ACTIVE`/`STOPPED`/`CREATED`/`ENDED`/NULL (오타 `STOPPPED` 소량). ⚠️`PAUSED` 없음 — 정지도 ACTIVE로 남는다(§5d) |
 | represent_car_id | int | FK → car.id (구독 대표 차량) |
 | product_id | int | FK → product.id |
 | started_at | datetime | 구독 시작일 |
 | stopped_at | datetime | 해지 시점 (churn 판정 → §5d). STOPPED인데 NULL ~90건 |
-| paused_at | datetime | 일시정지 시점 (ACTIVE + NOT NULL = 일시정지) |
+| paused_at | datetime | **마지막으로 정지를 건 시점.** 재개해도 안 지워진다 → `NOT NULL`≠정지 중(§5d, 27.7% 과대) |
 | ended_at | datetime | ⚠️해지일 아님. ACTIVE에선 현재 결제주기 종료일(=다음 갱신 예정일, 미래). 종료판정은 §5d CASE식으로 |
 | deleted_yn | tinyint | 0=정상 |
 | period | int | 주기 (숫자, period_unit과 조합) |

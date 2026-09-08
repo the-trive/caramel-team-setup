@@ -216,7 +216,11 @@ def main():
             git_has_commit = True
 
         # 1) force push (어떤 형태든)
-        if is_push and re.search(r"(\s)(-f|--force|--force-with-lease)(\s|=)", s):
+        # -qf 처럼 묶인 단축 플래그와 줄 끝의 -f 까지 잡는다. `+refspec` 도 force push다.
+        if is_push and re.search(
+            r"(?:^|\s)(?:--force(?:-with-lease)?(?:=\S*)?|-[A-Za-z]*f[A-Za-z]*|\+[^\s]+)(?=\s|$)",
+            s,
+        ):
             deny("force push 차단: 팀원 커밋을 덮어쓸 수 있음. 정말 필요하면 사람이 직접 터미널에서 실행하세요.")
 
         # 2) 원격 브랜치 삭제
