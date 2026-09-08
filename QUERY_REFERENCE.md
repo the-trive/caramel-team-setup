@@ -447,6 +447,9 @@ WHERE r.id=?;
 - 🔴 **셀장 정본이 둘이다 (2026-09-04).** 위 `supply_sheet.position='셀장'`은 HR 로스터 기준이고, **앱·zero-api가 쓰는 셀장 권한(`/v1/detailer/me`의 `cellAdminAvailable`, 셀 스케줄 화면, 동행·컨시어지 지정)은 `cell_membership` 테이블만 본다.** 판정 = `role='LEADER' AND deleted_at IS NULL AND effective_from <= UTC_TIMESTAMP() AND (effective_to IS NULL OR effective_to > UTC_TIMESTAMP())` (from 포함·to 미포함, UTC 저장). prod에는 셀 6개(`cell.code` Z1~Z6)·멤버십 50행이 **2026-09-08 00:00 KST부터 유효**하게 들어가 있다 — 그 전엔 활성 LEADER 0이라 "앱 셀장 없음"이 정답이다. "앱에서 셀장 메뉴가 안 보인다"는 이 테이블을, "누가 셀장인가(인사)"는 supply_sheet를 봐라. 두 결과가 다르면 둘 다 맞을 수 있다.
 - ⚠️ **`role='LEADER'`로 먼저 거르면 옛 셀장이 섞인다 (2026-09-08).** `cell_membership`은 겹치는 행을 DB가 막지 못해 **한 사람에게 동시에 유효한 행이 여러 개** 있을 수 있다. 서버 판정은 항상 **그 사람의 최신 행 하나**(`effective_from DESC, id DESC`)를 먼저 고르고 그 행의 role을 본다 — 옛 LEADER 행이 안 닫힌 채 남아 있고 최신 행이 MEMBER면 그 사람은 셀장이 아니다. 셀장 목록을 뽑을 땐 `role` 필터를 **SQL이 아니라 최신 행을 고른 뒤에** 걸어라. 같은 시점 두 셀에 동시 소속이면 서버는 **소속 없음으로 fail-closed**한다(어느 셀 scope도 주지 않음). role 텍스트는 대소문자·공백 무시 collation이라 `'leader '`도 필터를 통과한다 — 값 비교 전에 trim+upper.
 - ⚠️ **`cell.code` Z1~Z6은 `zone` 테이블의 Z1~Z6과 이름만 같은 다른 축**(§위 BELT 경고와 같은 함정). 셀↔존 매핑은 `zone_cell_assignment`(effective-dated, 셀당 zone 3개·공용 zone은 셀 2개)로 따라가고, `cell_name`·`region`으로 재구성하지 말 것. 셀장의 그날 동행 셀원은 `cell_accompaniment`(service_date KST, deleted_at NULL).
+- 🔴 **셀장이 셀원 예약을 대신 실행해도 `reservation.detailer_id`는 셀원 그대로다 (2026-09-08 실측).** 동행 실행(2026-09-03 배포)에서 예약·정산·통계·인센티브는 전부 셀원 소유로 남고, 권한만 `cell_accompaniment` + `cell_membership`(LEADER)로 그날 하루 열린다. ⟹ **"디테일러 X가 오늘 실행한 세차"를 `reservation.detailer_id=X`로 뽑으면 셀장이 실행한 건이 통째로 빠진다.** 디테일러 이름으로 문의가 들어왔는데 그 사람 예약이 안 나오면 그날 `cell_accompaniment`에서 `leader_detailer_id=X`인 행을 보고 `member_detailer_id`로 다시 조회할 것.
+  - ⚠️ **누가 실제로 눌렀는지는 서버에 안 남는다.** `checkup.detailer_id`·`detailer_reservation_call.detailer_id`는 그 행을 만든 시점의 actor 스냅샷일 뿐이고, 이후 단계를 셀장이 이어받았는지 셀원이 했는지 구분하는 컬럼·로그가 없다. "누가 했나"를 DB로 확정하려 하지 말 것.
+  - `cell_accompaniment.service_date`는 DATE라 드라이버가 하루 밀려 렌더한다(§5a) — `DATE_FORMAT(service_date,'%Y-%m-%d')`로 읽을 것. 렌더 `2026-09-07T15:00:00.000Z` = 저장 `2026-09-08`.
 
 **디테일러 로그인 정체성 = `detailer.user_id → app_user`**:
 - 디테일러앱 인증번호 발송(`POST /v1/auth/detailer/certification-code/send`)은 `detailer.deleted_yn=0 AND retired_yn=0` **AND 연결 `app_user.deleted_yn=0 AND test_yn=0`** 이어야 201. 하나라도 깨지면 앱은 "인증번호 발송에 실패했어요"라고만 보여 SMS 장애로 오해한다. **가장 흔한 원인 = 그 사람의 고객앱 탈퇴**(app_user deleted_yn=1)라 SMS 로그를 볼 필요가 없다.
@@ -1565,6 +1568,9 @@ BEFORE/AFTER 섹션 종류:
 - 🔴 **컨시어지 케어 항목의 식별자는 `section`이 아니라 `(section, tag, index)` 3개 조합이다 (2026-09-06 실측).** 한 섹션에 항목이 여러 개 들어간다 — 내부 오염 한 섹션에 '운전석 매트'·'콘솔'·'카시트'가 각각 전/후 한 쌍씩. `tag`가 고객에게 보이는 항목 이름(디테일러 자유 입력 또는 프리셋)이고, **같은 tag가 두 번 나올 수 있어** 그때 `index`(그룹 안에서 0부터)가 구분한다. `GROUP BY section`으로 항목 수를 세면 서로 다른 항목이 한 덩어리가 된다.
 - ⚠️ **접두사가 `WOW_FLOW/` → `CONCIERGE_CARE/`로 바뀌었지만 기존 행은 마이그레이션 안 됐다** (2026-09-02 이름 통일). 2026-08 이전 건까지 세려면 `section LIKE 'WOW_FLOW/%' OR section LIKE 'CONCIERGE_CARE/%'` 둘 다 걸 것. 반대로 `CONCIERGE_CARE/FRONT_DIRTY`·`/FILM_REMOVAL_PROCESS`는 코드에만 있고 prod 행이 0건이다(실데이터는 전부 `WOW_FLOW/` 접두사).
 - 🔴 **오염 사진 5종이 다 "오늘 한 일"이 아니다.** 그날 실제로 진행하는 건 `CUSTOMER_CARE`(신경쓰는 곳) · `VEHICLE_TRAIT`(차량 특징) · `SHOWCASE_CONTAMINATION`(전/후 대비, 추가 촬영) 3종이고, `EXTERIOR_CONTAMINATION`·`INTERIOR_CONTAMINATION`은 **케어 제안용 진단 사진**(세차 전 촬영 → '케어할 오염 선택' 단계 입력)이다. 그중 무엇을 실제로 진행했는지는 **디테일러 앱 로컬(AsyncStorage)에만 있고 서버엔 없다**(`wash_result_contamination_plan` 테이블은 비어 있는 dormant 구조). → **"진행한 케어 건수"를 오염 사진 수로 세지 말 것.**
+- 🔴 **`status='BEFORE' AND section='CONCIERGE_CARE/VEHICLE_TRAIT'` 행이 없으면 그 세차는 마지막 제출에서 반드시 실패한다 (2026-09-08 실사례, wash_result 46924).** 차량 특징 화면엔 "건너뛰기"가 있어 특징 없이 지나갈 수 있는데, 케어 제안 화면의 제출은 그 값을 필수로 요구해 앱이 **서버 호출 전에** 예외를 던진다(`전송 실패 / 세차 정보를 저장하지 못했습니다`). 서버 계약(`WashCompletionCommunicationContextV1.vehicleTrait`)도 필수라 우회 없음.
+  - ⟹ **API 로그·DB에 실패 흔적이 전혀 없다. 유일한 지문이 이 행의 부재다.** "제출이 안 된다" 문의가 오면 먼저 이걸 세라: `SELECT SUM(status='BEFORE' AND section='CONCIERGE_CARE/VEHICLE_TRAIT') FROM wash_result_image WHERE wash_result_id=?` → 0이면 원인 확정.
+  - 동반 지문: `status='AFTER'`인 VEHICLE_TRAIT 행의 `tag`가 NULL이다(정상 건은 BEFORE와 같은 tag가 들어간다). 세차는 `wash_result.status`가 `CONCIERGE_CARE/GUIDE_RESPONSE`에, 예약은 `IN_PROGRESS`에 멈춘다.
 - 🔴 **평가 컬럼(`evaluation_status`, `evaluated_at`, `evaluator`)은 가동 중이다 — "전량 PENDING·미사용"이라는 옛 서술은 폐기 (2026-08-14 실측).** Droplet 사진품질 크론이 KST 08:30에 채운다. 2026-06-17~08-13에 **11,319장** 평가됨(PASS 10,653 / WARN 590 / FAIL 76). 단 아래 셋을 안 걸면 결과가 뒤집힌다:
   - **샘플링이다. 전수가 아니다** — 디테일러당 **1예약/일**만 평가한다. "지적 없음"은 *"평가된 건 중 지적 없음"*이지 "무결점"이 아니다. 비율을 낼 때 분모를 세차 전체로 잡지 말 것.
   - **v1 평가기(~2026-06-15)는 과탐지라 반드시 컷오프** — v1은 WARN 84%(회전 오판·불가능한 기준·빈 사유). `evaluated_at >= '2026-06-17'`을 쓴다. 06-15가 아니라 **06-17**인 이유 = 크론 대상일 off-by-one 버그가 06-16에 고쳐져 그 이전 구간은 평가 대상일이 하루씩 밀려 있다.
@@ -1750,6 +1756,28 @@ CRM·트랜잭션 메시지 발송 기록 테이블.
   - 🔑 **이미 나간 건은 `message` 행 하나로 발신 주체가 갈린다 — charts 레포 없이 사후 판정 가능 (2026-09-07 실측).** `JSON_EXTRACT(message,'$.result.messageId')` 가 있으면 **zero-api**(신형), `JSON_EXTRACT(message,'$.response.data.msgid')` 가 있으면 **레거시 caramel-api**. 한 날짜를 `GROUP BY type` + 두 포맷 카운트로 찍으면 어느 알림이 어느 서비스에서 나갔는지 한 장에 보인다. 실사례: 9/7 `parkingInfo001` 157건 = 전부 구형(레거시), 같은 날 나머지 알림톡 13건 = 전부 신형(zero).
   - 발송한 크론 역추적 = `message.job_execution_id` → `job_execution.job_id` → `job.name`. 대상 필터를 확인할 코드를 어느 레포에서 열지는 위 포맷 판정으로 정한다.
 - 🔴 **`job.status='ACTIVE'`는 "돌고 있다"의 근거가 아니다 (2026-08-25 실측).** 테이블명은 **`job`**(`cron_job` 아님). 살아 있는지 판정하려면 두 가지를 같이 봐라: ① `job_execution`의 최종 실행 시각(`MAX(created_at)`), ② 그 job 이름의 핸들러가 코드에 실존하는지(zero-api `cron-internal.controller.ts`의 `@Post('/<jobName>')`). 실사례 — `sendRainRetouchAvailablePush`는 status `ACTIVE`인데 컨트롤러에 엔드포인트가 없고 2026-05-26에 5회 돌고 멈춰 있었다(리터치 알림이 통째로 안 나감), `sendRainPolicyUpdatedNotifications`는 61일 연속 매일 돌다 2026-07-19에 정지.
+
+### 6i. 고객↔디테일러 인앱 채팅 읽음 판정 (`chat_room`·`chat_participant`·`chat_message`) (2026-09-08 실측)
+
+`chat_room`(방) → `chat_participant`(참가 entity, 단톡 가능) → `chat_message`(버블) → `chat_message_content`(본문 JSON). 2026-07-01 prod~.
+
+- 🔴 **`chat_message.sender_participant_id`는 `chat_participant.id`다 — `detailer.id`도 `app_user.id`도 아니다.** 이걸 `detailer.id`에 바로 조인하면 **에러 없이 엉뚱한 디테일러 이름**이 나온다(실측: sender_participant_id 137·175·194는 실제 발신자 김희헌·이형준·황석찬인데, detailer로 직접 조인하면 김성영·김민호·박정규가 찍힌다). 표준형은 항상 2단 조인:
+  ```sql
+  JOIN chat_participant sp ON sp.id = m.sender_participant_id
+  JOIN detailer d ON d.id = sp.participant_id AND sp.participant_type = 'DETAILER'
+  ```
+- **`chat_participant.participant_id`는 `participant_type`에 따라 가리키는 테이블이 갈린다** (polymorphic, FK 없음): `DETAILER`→`detailer.id`(⚠️ `detailer.user_id` 아님), `USER`→`app_user.id`, `PARTNER`→`partner.id`. type을 안 걸고 한 테이블에 조인하면 id가 우연히 겹쳐 조용히 틀린다.
+- **읽음 판정 = `cp.last_read_message_id >= m.id`** (진우님 설계: id 작으면 읽음, 크면 안읽음). `last_read_message_id IS NULL`이면 **그 방에서 한 번도 안 열어봤다는 뜻**. 방별 고객 읽음 여부:
+  ```sql
+  JOIN chat_participant cp ON cp.chat_room_id = m.chat_room_id AND cp.participant_type = 'USER'
+  -- 읽음 = cp.last_read_message_id >= m.id
+  ```
+  ⚠️ NULL을 "추적 미구현"으로 읽지 말 것 — 같은 시점 82명 중 26명은 값이 찍혀 있다(2026-09-08). 기능은 돈다.
+- 🔴 **`visibility='STAFF_ONLY'`는 고객에게 안 보이는 내부 메모다 — 읽음률 분모에서 빼라.** `content_type='INTERNAL_MEMO'`와 짝. 이걸 안 빼면 **"고객이 안 읽은 메시지"로 오분류**된다(실사례 2026-09-08: 셀장 채팅 읽음 집계에서 김정수 건이 "6건 중 5건 읽음"으로 나왔는데, 안 읽힌 1건이 STAFF_ONLY 내부 메모였고 고객에게 보인 5건은 전부 읽음이었다). 고객 관점 집계엔 항상 `m.visibility='ALL' AND m.deleted_at IS NULL`.
+- `content_type` = `TEXT`·`IMAGE_GALLERY`·`CATALOG_CARE_PROGRAM`·`CATALOG_CONDITION_RESET_PROGRAM`·`INTERNAL_MEMO`. 본문은 `content` JSON이라 텍스트 검색은 `chat_message_content`를 조인해야 한다.
+- ⚠️ **한 방에 디테일러가 2명 들어간 방이 있다**(실측 room 80·81·82). "방의 DETAILER = 담당자"로 가정하지 말고 **발신자(`sender_participant_id`) 기준**으로 셀 것.
+- **셀장이 보낸 것만 세려면** `cell_membership`으로 좁힌다 — `detailer` 테이블엔 셀장 컬럼이 없다. 판정 규칙은 §3a 셀장 판정 주의사항(최신 행 하나 → role 확인)을 그대로 따를 것. 2026-09-08 시점엔 사람별 유효 행이 1개씩이라 `role='LEADER'` 선필터와 결과가 같았지만, 겹침이 생기면 갈린다.
+- 시각 필터는 `created_at` **UTC 저장** — "오늘(KST)"은 `created_at >= '<어제> 15:00:00'`처럼 UTC 경계로 주고, `DATE(created_at)=CURDATE()`는 쓰지 말 것(§5a).
 
 ---
 
