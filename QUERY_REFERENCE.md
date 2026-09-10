@@ -587,6 +587,13 @@ GROUP BY s.detailer_id, d.name ORDER BY min_km;
 
 ---
 
+- 🔴 **현장 파견은 반얀만이 아니다 — `type LIKE 'BANYAN_TREE%'` 필터는 천호 파견자를 통째로 놓친다 (2026-09-10).** 현장(S/A 밀집 파견지) 정본은 **`field_site` 테이블**이다(반얀 `banyan`·천호 `hd-cheonho`). 슬롯 시각표(`slot_config.startTimes`)·주소·운영기간·플래그(`flags.slackChannelId/skipReminder/skipReport`)가 여기 있고 코드가 아니다.
+  - 그 현장의 파견 근무 `type` = `CONCAT('FIELD:', site_key)` **+ `JSON_KEYS(slot_config->'$.legacyTypes')`** (반얀 `BANYAN_TREE`·`BANYAN_TREE_EXTENDED`, 천호 `HD_CHEONHO`). 파견자 전체를 뽑을 땐 이 목록으로 `IN`을 걸어라. `type <> 'DEFAULT'`는 **`HEY_DEALER`(40행)·`INCHEON_TESLA`** 같은 세차 외 편성이 섞이니 쓰지 말 것.
+  - 실무 편성은 아직 **옛 이름**으로 넣는다(천호 `HD_CHEONHO`) — caramel-api 셔플 제외 필터가 리터럴만 알아 `FIELD:` 표기면 파견 기간에 홈존 예약이 들어온다.
+  - 현장 예약 판정 = `user_address.address` 와 `field_site.addresses[*].address` **완전 일치**(천호 `'서울 강동구 천호대로 1005 (천호동)'`). `LIKE '%천호대로 1005%'`는 `1005번길` 이웃 주소가 섞인다.
+  - 천호 파견 룰은 `service_region_group_id`·`zone_id` **둘 다 NULL** — zone 조인으로 후보를 세면 0명이다(반얀은 zone 8을 달고 있어 위 함정과 반대). 룰 시각 UTC `01:00~12:00` = KST 10:00~21:00, 경계는 `(D-1) 15:00:00`.
+  - ⚠️ `detailer_work_schedule_rule.start_time/end_time` 은 **DATETIME** 이다(TIME 아님). 저장 원문 `1970-01-01 01:00:00` — INSERT 에 `'01:00:00'` 만 쓰면 `Incorrect datetime value` 로 실패한다(2026-09-10 실측). 헬퍼 JSON 은 `1969-12-31T16:00:00.000Z` 로 렌더한다(§5a −9h).
+
 ### 3e. 디테일러 생산성 — 작업 소요시간·이동 간격 (2026-08-06 실측)
 
 "1인당 하루 몇 대까지 가능한가"를 따질 때 쓰는 3종. 세 군데 다 함정이 있다.
