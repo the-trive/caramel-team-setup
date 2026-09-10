@@ -664,6 +664,15 @@ GROUP BY d.id HAVING sub IS NULL;
 
 ---
 
+### 3g. 컨시어지 케어 접점 정본 — 전날 전화·세차 전/후 응대·세그먼트 (2026-09-10 실측)
+
+케어 모니터링(어드민)과 패턴 분석이 쓰는 정의다. 다른 정의로 뽑으면 화면 숫자와 안 맞는다.
+
+- 🔴 **전날 전화의 대면 수락/거절 = `detailer_reservation_call_item` `type='KEY_HANDOVER'`, `value IN ('true','false')`.** 일반 예약에서는 키 전달 방식이고 **컨시어지 지정 건(`concierge_care` marker)에서만** 대면 수락 여부다 — 앱이 `isConciergeCare`로 라벨만 바꾼다. 정본은 **답이 있는 마지막 통화**(`call.id DESC`) — 다시 걸어 바꾼 답이 이긴다. true/false가 아닌 값은 "안 물어본 것"이고 `false`(거절)로 읽지 마라. 항목 서브쿼리에도 `value IN (...)`을 같이 걸어라 — 마지막 항목이 다른 값이면 앞의 답을 잃는다.
+- **세차 후 응대 = `wash_result.post_wash_guidance_method`, NULL이면 `crm_type` 폴백**(옛 행). **세차 전 응대 = `wash_result.pre_wash_guidance_method` — 2026-09-10부터 계측**이라 그 전 행은 전부 NULL이다. 미기록은 값으로 두고 감추지 마라. 둘 다 `FACE_TO_FACE_EXPLAIN`→대면으로 정규화(§6d).
+- **세그먼트 축**: 신규 = 같은 `user_id`의 앞선 완료(`WASHED`·`REPORT_SENT`) 예약 없음(**고객 기준** — 기존 고객의 새 차는 신규가 아니다. 9/10 목업 실측은 차 기준이었으니 그 숫자와 비교할 땐 주의). 구독 = `subscription.deleted_yn=0 AND status='ACTIVE'` 보유(조회 시점). 범위 = §3e origin 스냅샷 `$.serviceGroupId`. 세 축은 한 번에 하나만 걸어라 — 동시에 걸면 칸마다 한두 건이라 아무것도 안 보인다.
+- ⚠️ 타임라인 행은 시각 앵커가 있어야 놓인다(전날 전화 `called_at`, 세차 전 `reservation_status_log status='IN_PROGRESS'`, 세차 후 `reservation.washed_at`). 앵커가 NULL이면 값은 있어도 행이 없다 — 목록 값과 타임라인 행 수가 다르면 먼저 이걸 의심하라.
+
 ## 4. 검증 기준 (Invariant)
 
 분석 결과가 아래를 위반하면 쿼리 로직에 버그가 있는 것:
@@ -1715,6 +1724,7 @@ BEFORE/AFTER 섹션 종류:
 - **직접 짜지 말 것 — 완성본이 있다: `~/claude/scripts/tmp_mar_revenue.sql`.** 위 5단계가 전부 구현돼 있다. 날짜 리터럴(`'2026-03-01' AND '2026-03-31'`) 두 군데만 바꿔 실행하면 `wash_count / total_revenue / avg_revenue_per_wash`가 나온다.
 - ⚠️ **`reservation_revenue`는 테이블이 아니다** — 위 SQL 안의 마지막 CTE 이름이다. `JOIN reservation_revenue`를 쓰면 실행 자체가 실패한다. (2026-07-26 실사례: 테이블로 착각해 "매출 산출 불가"로 오판 후 근사치로 대체함)
 - ⚠️ **`cbr_daily_revenue_snapshot.total_revenue`를 보고용 매출로 쓰지 말 것** — 실제 대비 **25~30% 과소**. (2026년 5월: 스냅샷 1.36억 vs 실제 1.80억) 빠른 감만 볼 때 외 금지.
+- ⚠️ **같은 테이블의 1회권/구독 분리 컬럼(`washes_onetime`·`revenue_onetime`·`washes_sub`·`revenue_sub`)은 2026-05-25부터 전부 0**이다(전체 컬럼 `completed_washes`·`total_revenue`는 계속 적재됨). 이걸로 "1회권 vs 구독 세차당 매출"을 뽑으면 NULL만 나온다 — 구독 여부는 `user_service.subscription_id`로 라이브 계산할 것. 또 `date='1969-12-31'`(epoch 0) 행 1개가 섞여 있어 `WHERE date >= ...` 하한 없이 MIN/전체 집계하면 걸린다(2026-09-10 실측).
 - 검증 기준: 위 SQL 재현값 vs `Caramel_monthly(A)` 시트 확정값 오차는 **+0.4~0.6%가 정상**(2026년 3·4월 실측). 이 범위를 넘으면 필터를 의심할 것.
 - ⚠️ **후불(현장수금) 예약은 이 매출 SQL에서 통째로 0원이다.** CTE가 `IF(us.payment_id IS NULL, 0, …)`라 payment가 없는 후불 예약은 금액이 0으로 깔린다. 후불을 포함한 매출을 내려면 `reservation_onsite_collection` 수금액(§ 해당 섹션 공식)을 **세차일(`reservation.reservation_datetime`) 기준으로 별도 가산**해야 한다. (2026-07-27 CBR v2 실측: 7/20주 타겟 매출 1,477만 → 후불 8건 74.7만 누락 = -5.1%)
 - ⚠️ **제휴처 오프라인 수금 매출은 DB 어느 매출 쿼리에도 안 잡힌다.** 두 패턴 모두 "결제 row를 봤으니 반영됐다"고 착각하기 쉬우니 `amount`가 아니라 **`amount − point`(현금)** 로 확인할 것:
