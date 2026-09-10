@@ -324,7 +324,7 @@ HAVING COUNT(DISTINCT ua.user_id) >= 5   -- 오탈자성 1~2건 단지 제거
   - NULL + `booked_online_yn=1` = 5,841건(동기간). `*_RESERVATION_CREATED` change_log가 없는 경로라 **능동으로 단정 금지.**
   - ⚠️ **`CUSTOMER_DIRECT` + `booked_online_yn=1`도 "고객이 직접 골랐다"의 증거가 아니다.** 빙의(`POST /users-admin/{id}/access-token`)와 전화 안내가 같은 지문을 만든다. 고객 자발성 판정은 **선행 이벤트(세차권 발급 등)와의 시간차**로 — 수분 이내면 CS 오케스트레이션이다.
 - **제외 대상(자동/관리자)**:
-  - `CHECKOUT_SETTLEMENT`: 구독 결제 시 자동 배치 예약
+  - `CHECKOUT_SETTLEMENT`: 소량만 이 값을 갖는다. 🔴 **구독 자동예약을 이 값으로 세지 말 것 (2026-09-10 코드+실측).** 자동예약 생성 코드(caramel-api `subscription-renewal.service.ts` `createAutoReservations`)는 템플릿에서 `source_type`을 지우고 다시 넣지 않아 **NULL로 저장된다.** 고객 직접 예약도 NULL이라 **둘을 DB에서 구분할 수 없다.** 실측(2026-09-09 미래 확정예약 5,225건): NULL 4,488 · CUSTOMER_DIRECT 632 · CHECKOUT_SETTLEMENT **70** · ONBOARDING_V3 35. 자동예약을 세려면 `source_type` 대신 **리드타임**(자동=평균 46일, 고객 직접=8.6일)이나 `user_service.subscription_id` 유무로 근사할 것
   - `RAIN_RETOUCH`: 비 오는 날 재세차 자동 배정
   - `MANUAL_EVENT_IMPORT`: 관리자 수동 입력
 - ⚠️ `reserved_with_date` 컬럼은 레거시 — 능동/자동 구분에 사용 불가. 실제 분포: 0=~12500건, 1=98건뿐.
@@ -511,6 +511,8 @@ JOIN zone z ON z.id = r.zone_id     -- ⚠️ service_zone 테이블 없음 — 
   ```
   실측(2026-09-08 기준 예약 주소 693개): **1행 684 · 0행 8 · 2행 1**. ⟹ "룰 분포로 어느 체계가 사는지 역추적"하는 아래 우회는 이제 보조 확인용이다.
 - ⚠️ **세대 필터를 안 걸었을 때 "항상 2행"은 아니다** — 구세대에 없던 지역은 1행(예 `25:Z6 경기남부`), 신구 경계가 겹치면 3행, 폴리곤 밖은 0행이다. 신세대끼리 겹치는 좌표도 1건 있다(주소 45440 → `20:Z1 강북서·고양` + `21:Z2 강북동·도심`) — `LIMIT 1`로 집으면 조용히 갈린다.
+- 🔑 **"공용구역 디테일러"는 별도 로스터가 아니라 근무 룰의 zone_id로만 갈린다 (2026-09-09 실측).** 유효 `DEFAULT` 스케줄의 활성 룰을 `GROUP BY detailer_id`로 펼치면 **두 모양뿐**이다: 요일마다 **공용존 2개**를 든 사람(예 `MON:17,MON:16,TUE:17,TUE:16,…`)과 **전담존 1개**만 든 사람. 겸업(공용+전담)은 0명이라, 공용구역 담당자 = **자기 룰의 zone_id가 전부 14~19인 사람**으로 깔끔하게 갈린다(2026-09-09 기준 52명 중 11명). `detailer_supply_sheet.cell_name`·`region`으로 재구성하면 안 된다 — 셀은 공용존과 전담존을 동시에 맡으므로 사람이 갈리지 않는다.
+  - ⚠️ 룰이 구세대 zone_id(1~13)인 사람은 이 판정에서 **어느 쪽도 아니다**(2026-09-09: 셀장 6명 + 1명이 여기 남아 있다). "공용도 전담도 아닌 사람"이 나오면 버그가 아니라 §위 세대 잔존이다.
 - **존↔셀 매핑 = `zone_cell_assignment`**(zone_id, cell_id, effective_from/to, deleted_at) + `cell.code`(Z1~Z6). 전담존(`kind='CELL_EXCLUSIVE'`, id 20~25)은 셀 1:1이라 존 게이트가 셀 게이트 구실을 하고, **공용존(`kind='CELL_SHARED'`, id 14~19)은 셀 2개가 나눠 맡는다**(P0=Z3·Z4, P1=Z3·Z6, P2=Z5·Z6, P3=Z2·Z5, P4=Z1·Z2, P5=Z1·Z4).
 - 🔴 **셔플은 공용존 예약을 아예 건드리지 않는다 (caramel-api, 2026-09-05 prod).** `route-optimization.service.ts`가 `zoneKind='CELL_SHARED'`인 예약을 대상에서 뺀다 — 옮기지도, 교환으로 받지도 않는다(공용 조각을 누가 맡을 자격이 있는지가 그 레포에 없어서 내린 보수 조치). 물량이 작지 않다: 2026-09-08~11 CONFIRMED **185/732건 = 25.3%**. "셔플이 이 예약을 왜 안 옮겼나"의 첫 확인 항목.
 - 🔴 **룰의 `zone_id`가 구세대면 그 디테일러는 신세대 예약과 절대 매칭되지 않는다** — 셔플에서는 내보내기만 되고 **수신 0**이 된다. 실측(2026-09-08): 셀장 6명(21·80·87·97·114·161)이 `cell_membership`엔 LEADER로 들어갔는데 근무 룰 zone_id는 여전히 2·3·5·6·7·10·12였다. 사람별 존을 볼 때 **룰의 zone_id 세대와 대상 날짜의 세대를 대조**할 것.
@@ -558,6 +560,7 @@ GROUP BY s.detailer_id, d.name ORDER BY min_km;
 3. **채택 판단은 거리가 아니라 "동선 사이에 끼는가"** — 후보의 직전/직후 예약 시각·좌표를 뽑아 삽입 가능한지 본다(+ 하루 5건 캡). 목표가 기존 동선 한복판에 떨어지는 후보가 정답.
 4. ⚠️ `detailer_holiday`는 **UTC 저장**이라 "그날 휴무" 판정 윈도우는 `from < 'X일 14:59:59' AND to > '(X-1)일 15:00:00'`. `from <> to` 필터도 같이(§6b 무력화 row). 그래도 예약이 있는 사람이 휴무로 잡히는 경우가 있으니 **route와 교차확인**.
    - 🔴 **하루 겹침만 보면 "부분 시간 블록"이 종일 탈락으로 번져 후보를 잃는다 (2026-07-26 실사례).** 황석찬(114)에게 memo `셀원 품질 점검`으로 **매일 UTC 05:00~09:00(=KST 14~18시) 4시간 row가 4월~8월 대량 선삽입**돼 있어, 겹침 필터로는 "휴무 있음"이 되지만 오전은 근무 가능이다. **판별 = `TIMESTAMPDIFF(HOUR, from, to) > 8`이면 종일, 이하면 부분 블록**(+`memo` 확인). 위 쿼리처럼 두 NOT EXISTS로 분리할 것.
+   - 🔴 **거꾸로, 부분 블록 여러 개가 이어 붙어 근무일 전체를 덮는다 — row 하나만 보면 "반나절 가능"으로 오답한다 (2026-09-08 실측).** 위 `> 8시간` 판별은 **row 단위**라, 하루를 두세 토막으로 나눠 등록하면 전부 "부분 블록"으로 통과한다. 실사례: 김용빈96 9/10 = `백화점 시연·팝업 파견` KST 10:00~14:00 + `연차 - 반차/오후` 14:00~19:00 → 각 4·5시간이라 둘 다 부분 블록인데 **합치면 근무창 10~19시 전체**다. 천호 5칸(10:30·12:30·14:30·16:30·18:00)이 통째로 겹친다. 드문 일이 아니다 — 6월 이후 **10건**(`셀원 품질 점검`+`셀장 영업 교육`, `SA급 공정 교육`+`반얀트리 체험`, `06시 출근` 3토막 등). ⟹ **가용 판정은 row별로 하지 말고 그 사람의 그날 휴무 row를 전부 모아 구간 합집합을 만든 뒤 예약 구간과 대조할 것.** 탐지 쿼리 = `GROUP BY day, detailer_id HAVING COUNT(*)>=2 AND MAX(TIMESTAMPDIFF(HOUR,from,to))<=8 AND SUM(...)>=8`.
    - 🔴 **다일 종일 휴무의 마지막 날은 `to`의 날짜가 아니다 (2026-09-01 실측).** 종일 휴무는 `to`가 **끝난 다음 날 KST 00:00**으로 박힌다 — id 12284 = KST `8/31 00:00 ~ 9/2 00:00` = 8/31·9/1 **이틀**이고 9/2는 근무일이다. `DATE(to)`로 마지막 날을 세면 하루를 더 센다(마지막 날 = `DATE(to - INTERVAL 1 SECOND)`). 위 윈도우식의 `to >`가 strict인 이유가 이것이고, `>=`로 바꾸면 안 쉬는 날이 휴무로 잡힌다. 같은 실수를 편성 화면 코드가 냈다 — 지울 수 없는 유령 휴무 줄(zero PR #1859).
    - ⚠️ 반대 방향도 틀린다 — 같은 사람에게 **종일 row가 별도로 존재**할 수 있다(황석찬은 `출산 휴가 - 연차` 7/19~7/31 종일 row가 있어 결과적으로 탈락). **부분/종일 둘 다 조회해야 정답.** 한쪽만 보고 "가용/불가"를 확정하지 말 것.
 5. 실행 전 §6b "재배정 대상 사전검증"을 반드시 통과시키고, 실행은 재배정 API로(DB 직접 UPDATE 금지). `skipConflictCheckYn=false`로 두면 TMap 실이동시간 기반 충돌체크가 돌아 삽입 타당성을 한 번 더 걸러준다.
@@ -592,7 +595,7 @@ GROUP BY s.detailer_id, d.name ORDER BY min_km;
 
 🔴 **컨시어지 케어 예약은 위 산식 위에 최소값(floor)이 얹힌다 (2026-09-08 코드 확정, `concierge-care-duration.policy.ts`).** 활성 케어 marker가 그 예약의 **현재 담당자와 일치할 때만** 산식값을 **외부만 100분 / 내부까지 140분**으로 끌어올린다(산식값이 이미 더 크면 그대로). 판정 입력은 서비스 묶음이 아니라 **실제로 내부까지 하는가** — 원래 묶음이 외부+내부거나 `내부 세차 추가` 옵션이 붙으면 140분이다. 내부만·미지 묶음엔 floor가 없다. ⟹ 케어 예약 소요분을 §3e 산식만으로 재구성하면 안 맞는다.
 
-🔴 **케어 지정은 예약의 세차권 서비스를 `컨시어지 케어 체험`(service 145, `service_group_id=1` = 외부+내부)으로 갈아치운다. 원래 상품은 `user_service`에 남지 않는다 (2026-09-08 실측).** 모니터링을 위한 의도된 교체다. 그래서 케어 예약에 `JOIN service`로 세차 범위를 읽으면 **전부 외부+내부로 나온다** — prod 18건 중 12건이 원래 외부만인데 그렇게 보인다. 원래 상품의 정본은 `reservation_change_log`의 `JSON_EXTRACT(data,'$.type') = 'CONCIERGE_CARE_SERVICE_CLASSIFICATION_CHANGED'` → `$.fromServiceId`(전 기간 커버, 예약별 첫 로그가 원본)다. "케어 예약의 세차 범위 비중"을 물으면 `service`가 아니라 이걸 봐라. ⏭️ `reservation_metadata` `key='concierge_care_origin_service'`(JSON `serviceId`·`serviceGroupId`·`serviceName`·`timeRequired`)가 같은 값을 담을 예정 — 코드가 머지되면 신규 지정분부터 생기고 기존 18건은 위 로그에서 소급 생성한다. 그때까지는 로그가 유일한 소스다.
+🔴 **케어 지정은 예약의 세차권 서비스를 `컨시어지 케어 체험`(service 145, `service_group_id=1` = 외부+내부)으로 갈아치운다. 원래 상품은 `user_service`에 남지 않는다 (2026-09-08 실측).** 모니터링을 위한 의도된 교체다. 그래서 케어 예약에 `JOIN service`로 세차 범위를 읽으면 **전부 외부+내부로 나온다** — prod 18건 중 12건이 원래 외부만인데 그렇게 보인다. 원래 상품의 정본은 `reservation_change_log`의 `JSON_EXTRACT(data,'$.type') = 'CONCIERGE_CARE_SERVICE_CLASSIFICATION_CHANGED'` → `$.fromServiceId`(전 기간 커버, 예약별 첫 로그가 원본)다. "케어 예약의 세차 범위 비중"을 물으면 `service`가 아니라 이걸 봐라. ✅ **2026-09-08부터 `reservation_metadata` `key='concierge_care_origin_service'`(JSON `serviceId`·`serviceGroupId`·`serviceName`·`timeRequired`)가 정본이다** — prod 배포 + 기존 18건 소급 생성 완료(change log와 1:1 대조). 세차 범위는 이 스냅샷 `$.serviceGroupId`(1=외부+내부·3=외부만)를 먼저 읽고, 없으면 `user_service→service.service_group_id`로 폴백. 해제돼도 스냅샷은 안 지우므로 `concierge_care` marker `deleted_at IS NULL`과 함께 걸어야 "지금 케어인 건"이 된다.
 
 🔴 **실제 작업 소요시간의 정본은 `wash_result.created_at` → `wash_result.finished_at`이다. `reservation.estimated_time`을 쓰지 마라** — 그건 차량 티어·서비스에서 나온 **산식(계획값)**이지 측정값이 아니다. 부하 랭킹(§6b)엔 계획값이 맞지만 "실제로 몇 분 걸리나"엔 틀린다.
 
@@ -884,6 +887,7 @@ WHERE us.reservation_id IS NULL OR r.id IS NULL
 - **카라멜 세차 객단가 정본 = (전체 세차매출 − 헤이딜러 건수×8.80만) ÷ 카라멜 세차 횟수.** `Caramel_monthly(A)` 시트 22행('세차 객단가 > 카라멜')이고, `tmp_mar_revenue.sql`의 `avg_revenue_per_wash`와 같은 값이 나온다(실측 2026-04 50,020원 / 05 51,657 / 06 54,423 = 시트 5.01·5.17·5.44와 일치).
 - ⚠️ **`세차 매출 ÷ 합계 세차 횟수`로 계산하면 틀린다** — 헤이딜러(외부공급) 건수가 분모에 섞여 값이 눌린다(2026-04 기준 4.88만 vs 정본 5.00만).
 - 🔴 **객단가 상승을 "옵션이 팔렸다"로 먼저 결론내지 말 것.** 분해 순서는 ①`item_kind`별(세차권/옵션/서비스변경) 기여 ②세차권 안에서 **정가 불변인지** 확인. 실측 2026-04→06 +8.8% 중 세차권 73% · 옵션 23%였고, **정가 인상은 0원이었다** — 같은 티어·같은 서비스의 `originalPrice`가 그대로였고(1회권 외부+내부 T3 59,536→60,000) 바뀐 건 **정가 실현율**이다(외부만 T4 67%→97%, 외부만 T5 48%→98%). 즉 원인은 가격 인상이 아니라 **프로모션·쿠폰 할인 축소 + 무상(0원) 세차 비중 감소**다.
+- 🔑 **"슬롯 하나가 얼마짜리냐"(구독 세그먼트별 단가)는 정가 ÷ 횟수로 계산하지 말 것.** 일시정지·미사용·부분환불 때문에 실현값과 벌어진다. 정본 = **그 달 그 상품의 구독 결제액 ÷ 그 달 그 구독으로 나간 완료세차 건수**(결제는 `payment.type='SUBSCRIPTION' AND status IN ('PAID','PARTIAL_CANCELED') AND amount>0`, 세차는 `user_service.subscription_id` 경유). 2026-08 실측: 외부만 월2회 26,140원 · 외부만 월4회 24,534원 · 그 외 구독 81,539원 — 정가 나누기(월2회 42,461÷2=21,231)보다 20% 이상 높다.
 - **실현율 뽑는 법**: `tmp_mar_revenue.sql`의 `items_with_point`에 이미 `original_price`(=`metadata.prices[].originalPrice`)가 있다. `SUM(net_amount)/SUM(list_amount)`를 **동일 `service_id`(티어×세차범위) 단위로** 볼 것 — 티어 믹스가 섞이면 가격 변화와 구분이 안 된다.
 
 ---
@@ -900,6 +904,24 @@ WHERE us.reservation_id IS NULL OR r.id IS NULL
 - **창 길이는 lag 분포를 재서 정하라.** 게이트가 길수록 최신 막대가 뒤로 밀린다(30일 게이트 = 최신 막대가 약 5주 지연). 실측 결과 30일 내 전환의 92%가 14일 안에 끝나 창을 14일로 줄였다(차량등록→예약 91.8% · 첫신청→첫세차 92.4%).
 
 ---
+
+### 4b-17. 🔴 **미래 확정예약의 세그먼트 구성은 실제 구성이 아니다 — 예약 리드타임이 세그먼트마다 5배 갈린다 (2026-09-09 실측)**
+
+"앞으로 잡혀 있는 예약이 누구 것이냐"를 `reservation_datetime >= NOW()`로 세면 **구독이 과대**하게 나온다. 구독 자동예약은 배치로 두 달치 달력을 미리 잡고, 1회권 고객은 임박해서 잡기 때문이다.
+
+2026-08 완료세차 기준 `DATEDIFF(reservation_datetime, created_at)`:
+
+| 세그먼트 | n | 평균 리드 | ≤3일 | >14일 |
+|---|---:|---:|---:|---:|
+| 외부만 월2회 | 1,617 | 46.3일 | 134 | 1,390 (86%) |
+| 외부만 월4회 | 352 | 45.8일 | 27 | 293 |
+| 그 외 구독 | 303 | 5.5일 | 169 | 27 |
+| 비구독 | 1,421 | 8.6일 | 884 (62%) | 126 |
+
+- 실측 괴리: 같은 날 미래 확정예약으로 재면 외부만 구독이 **4,675/5,179 = 90.3%**인데, 실제로 끝난 세차(2026-08)로 재면 **1,900/3,564 = 53.3%**다. 37%p 차이가 전부 리드타임 비대칭이다.
+- ⟹ **점유율·믹스·객단가는 완료(`WASHED`/`REPORT_SENT`) 기준으로 센다.** 미래 예약은 "지금 달력에 무엇이 잡혀 있나"에만 쓰고, 그 비율을 최종 구성으로 인용하지 말 것.
+- 🔴 미래 예약 건수는 날짜가 멀수록 급감한다(2026-09-09 기준: 9월 2,224 · 10월 1,987 · 11월 690 · 12월 219). **먼 달의 낮은 건수를 "수요 감소"로 읽지 말 것** — 예약 지평선 산물이다.
+
 
 ## 5. 공통 패턴
 
@@ -930,6 +952,12 @@ GROUP BY에 날짜 쓸 때 반드시 KST 변환 후 사용.
 - 🔴 **읽기 판정도 뒤집는다 (2026-09-01 실사례).** `detailer_holiday` 겹침 조회에서 raw JSON의 `"2026-08-30T06:00:00.000Z"`를 UTC로 믿고 "9/2를 덮는 휴무 0건"이라 결론냈는데, 저장 원문은 `2026-08-30 15:00:00`(=KST 8/31 00:00)이라 **9시간 어긋난 오답**이었다. ⟹ 날짜 경계가 걸린 판정은 처음부터 `DATE_FORMAT(DATE_ADD(col, INTERVAL 9 HOUR),'%Y-%m-%d %H:%i:%s')`로 KST 문자열을 뽑아 볼 것.
 - 세션 tz는 `Asia/Seoul`, 컬럼은 `datetime`(MySQL 무변환)이라 **저장 원문 = UTC 벽시계**다. 드라이버만 이걸 KST로 오해한다. Prisma는 같은 값을 UTC로 읽으므로 **앱이 보는 값 = DATE_FORMAT 원문**이고, JSON 렌더값이 아니다.
 - INSERT/UPDATE의 인라인 리터럴은 **verbatim 저장**됨 → SELECT에서 본 `Z` ISO 값을 그대로 복붙해 넣으면 9시간 어긋난다. 반드시 DATE_FORMAT으로 읽은 원문 기준으로 쓸 것.
+
+**⚠️ mysql-query.sh 실행 함정 (2026-09-08)**
+- **절대경로로 부르면 죽는다** — `~/.caramel-team-setup/mysql-query.sh "..."`는 `Cannot find module 'mysql2/promise'`로 실패한다(`node_modules`가 그 디렉터리에 있고 스크립트가 cwd 기준으로 require). **`cd ~/.caramel-team-setup && ./mysql-query.sh "..."`로 부를 것.** 스킬·문서에 절대경로로 적힌 곳이 있으니 그대로 믿지 말 것.
+- **prod는 `sql_mode=only_full_group_by`다** — `GROUP BY`에 없는 컬럼을 그냥 SELECT하면 쿼리가 통째로 거부된다(에러만 나고 결과 0). JOIN해온 부가 컬럼(`ss.status`·`ss.region` 등)은 `MAX(...)`로 감싸거나 GROUP BY에 넣을 것.
+- SQL이 `--`로 시작하면 옵션으로 파싱돼 실패한다 → 맨 앞에 공백 한 칸.
+- **dev DB도 같은 커넥션에서 읽는다 — 테이블 앞에 `` `caramel-dev`. `` 를 붙인다** (2026-09-08 실측): `` SELECT ... FROM `caramel-dev`.partner ``. 스크립트 헤더가 "기본 대상은 prod"라고만 적어 dev는 못 본다고 오해하기 쉽다. 쓰기는 가드가 막으니 SELECT 전용으로만 쓸 것(prefix 빠뜨린 DDL이 prod에 만들어진 사고가 이 경고의 출처다).
 
 **⚠️ DATE 컬럼(시각 없음)도 렌더링 함정 — 하루 밀림**
 - DATE 컬럼도 `...T15:00:00.000Z` ISO로 렌더됨: **렌더 X일T15:00Z = 저장 X+1일** (naive date를 KST 자정으로 해석해 UTC 직렬화).
@@ -1061,6 +1089,9 @@ JOIN entitlement_package_instance epi ON epi.id = epit.package_instance_id
 - **구독 세차**: `user_service.subscription_id IS NOT NULL`
 - **비구독**: `user_service.subscription_id IS NULL`
 - 🔴 **이 NULL 칸을 "1회권"이라고 부르면 틀린다 (2026-08-20 실측).** 5·10회 횟수권 소진분·제휴 커스텀 상품·`product_id`가 NULL인 지급분이 전부 같은 칸에 들어온다. 공동구역 타겟 완료세차(2026-04-01~08-18) 비구독 621건의 내역 = 1회권 성격 352(`외부 + 내부` 202·`외부만` 150) + `5회/10회 이용권` 89 + `product_id` NULL 167 + 제휴·커스텀 13. **"1회권 N건"으로 보고하면 상품명 기준 실제 1회권보다 1.8배 부풀려진다.** 최소한 `us.product_id → product.name`까지 까고, 진짜 세그먼트가 필요하면 §5c-2의 4단 판정을 쓸 것.
+- 🔴 **구독 상품은 `product_id`로 고르면 안 된다 — 같은 이름이 여러 id로 흩어져 있다 (2026-09-09 실측).** ACTIVE 구독 기준 `월 2회(외부만)`는 product **3555~3561 7개**, `월 4회(외부만)`는 **3563~3567 5개**에 나뉘어 있다(가격대·발급시기별). id 하나로 뽑으면 그 상품의 3분의 1만 잡힌다.
+  - 매칭은 **이름 부분일치**로: `p.name LIKE '%월 2회(외부만)%'`. **앞을 고정하지 말 것** — `[카라멜] 월 2회(외부만) AMG GT` 같은 개별 결제링크 상품이 `LIKE '월 2회%'`에서 빠진다.
+  - 세차권 3종(1회권)은 반대로 이름 매칭이 금지고 `car_tier_product.type`이 정본이다(§7 세차권). **1회권은 type, 구독은 이름** — 규칙이 반대라는 걸 헷갈리지 말 것.
   - 실사고: 같은 모수를 "구독/1회권/신규 3종"으로 집계한 기존 산출물이 월 468건이었는데, 비구독을 통째로 세면 508건이 된다. 구독·신규 칸은 ±3건으로 재현되고 **차이 40건이 전부 이 칸에서 나왔다.** 3종 합계를 인용할 때는 "무엇이 3종 밖으로 빠졌나"를 같이 확인할 것.
 
 **구독 첫 세차 식별** (user_id + subscription_id 기준):
@@ -1194,7 +1225,7 @@ JOIN reservation_draft d
   - 🔴🔴 **같은 사고가 하루에 세 번 났다 — 원인은 전부 '병렬 목록'이다 (2026-08-26).** ①위 화이트리스트 ②셔플 파견조 제외가 `!== 'BANYAN_TREE'` **부정형**이라 새 현장이 그냥 통과(파견자끼리 맞교환 가능) ③패키지 지급·취소 맵이 반얀 2종뿐이라 새 현장 상품을 **팔 수도 취소할 수도** 없었다. ⟹ 새 목록을 만들기 전에 **정본을 참조할 수 없는지** 먼저 보고(예: 취소 회차수는 `EntitlementPackageDefinition.instanceCount`, 키 목록은 `ENTITLEMENT_PACKAGE_KEYS`), 어쩔 수 없으면 **긍정형**(`=== 'DEFAULT'`)으로 쓴다. 부정형은 새 값을 조용히 통과시킨다.
   - 🔑 **prod 배포 검증은 쓰기 요청이 아니라 `https://api-prod.thetrive.com/openapi.json` 읽기로 한다 (2026-08-26).** 무인증으로 열려 있고 1MB 스펙 전문이 나온다 → `components.schemas.<Name>.properties.<field>.enum` 을 보면 **계약이 배포됐는지 즉시 확정**된다. ⚠️ 나는 이걸 모르고 지급 엔드포인트에 `POST` 를 30초마다 12번 보내 확인하려 했다 — user id 가 없어서 404 로 끝났지만 **존재하는 user 였으면 prod 에 12건을 지급**했다. 배포 확인용 폴링에 쓰기 메서드를 쓰지 말 것. (⚠️ 별건: prod API 스펙이 무인증 공개인 것 자체는 보안 검토 대상.)
 - 🔑 **패키지 세차권의 `service_id` 는 코드 상수가 아니라 DB 실측으로 확인한다.** `PREMIUM_WASH_PACKAGE_*` 도 반얀과 같은 **137**('프리미엄 세차 패키지 올클린 케어')이다. 뽑는 법 = `entitlement_package_instance` → `entitlement_package_item`(`package_instance_id`) → `user_service`(`epit.user_service_id = us.id`). ⚠️ `user_service` 에는 패키지로 가는 컬럼이 **없다** — `entitlement_package_item` 을 반드시 거친다.
-  - **일반(DEFAULT)**: zone·동선·이동시간 기반의 다른 스케줄링. **슬롯 시각 로직 미조사** — 위 08~22 그리드로 추론하지 말 것.
+  - **일반(DEFAULT)**: 상수 `SEOUL_SLOT_START_TIMES_UTC` → **KST 짝수시 12칸(00·02·…·22)**, 하루 전체가 열려 있다 (2026-09-08 코드 확정 — 종전 "미조사" 해소). ⟹ **DEFAULT는 그리드가 제약이 아니다.** 실제 칸은 rule 근무창이 자른다(표준 KST 10~19 → 10·12·14·16·18). 위 08~22 근사 그리드로 추론하지 말 것.
 - 실제 노출 = 상수 그리드 ∩ rule 근무 윈도우 ∩ 가드(예약버퍼·시각겹침·하루 `MAX_RESERVATIONS_PER_DAY=7`).
 - 그리드는 타입별 공용 상수 → 특정 디테일러만 다른 시각대 주려면 DB 아닌 **코드 변경 필요**.
 
@@ -1207,6 +1238,7 @@ JOIN reservation_draft d
 - KST 자정 경계를 UTC로 저장: **D일부터 유효 = effective_from `'(D-1) 15:00:00'`**, 영구 = effective_to `'2099-12-30 23:59:59'`.
 - 코드 lookup은 `dayjs(date).startOf('day')`(UTC 자정)와 `effective_from <= date <= effective_to` 비교 + 해당 요일 rule 매칭.
 - 🔴 **노출 슬롯 "개수"를 SQL로 재현하지 말 것 — 그리드 ∩ 근무창 모델은 과대추정이다 (2026-08-12 실측).** SQL은 예약의 **실제 점유 길이**(반얀은 조회 시 90분 하한으로 재산출)와 부분휴무를 못 빼서, 남은 FREE 조각이 duration보다 짧아 실제로는 안 뜨는 칸을 "열림"으로 센다. 실측: 이승원21 8/13 근무창 KST 08~16이고 08시에 예약이 없는데도 08시 슬롯 **0** — 09시 예약이 90분(09:00~10:30)이라 FREE가 `08:00~09:00` **60분**뿐이었다. SQL로 판정 가능한 건 "그 요일에 스케줄·rule이 있나"까지(effective 판정은 아래 양쪽 strict 항목). **칸 수는 API로 센다.**
+- 🔴 **어드민 예약 생성·시각변경의 "다른 예약 이동"(`requiresShuffle`)은 그 칸에 이미 예약이 있는 시각에서만 만들어진다** (2026-09-08 코드 확정, `reservation-slot-search.service.ts` 의 `candidateStartTimes` = occupant 시작시각). ⟹ **빈 칸이 뒤 예약과 겹쳐 사라진 경우엔 이동 제안이 아예 안 나온다** — 화면상 그 시각은 그냥 없다. 실측: 최지현172 9/22 근무창 KST 10~19·예약 12시·14시 → 컨시어지(140분 floor)로 10시를 잡으면 10:00~12:20 이 12시 예약과 겹쳐 소멸하는데, 10시엔 occupant 가 없어 이동 후보도 못 된다 → 노출은 `14*·16·18` 뿐. 대조군 9/17(18시만 예약)은 10시 정상 노출. ⟹ "왜 X시가 안 뜨냐"는 그리드·근무창·휴무보다 **요청 duration 이 다음 예약까지 물리는지**를 먼저 볼 것.
 - **그날 그 주소에 실제 몇 칸 뜨는가 = 무인증** `POST https://api-prod.thetrive.com/v1/scheduling/time-slots/query` body `{"addressId":N,"fromDate":"YYYY-MM-DD","toDate":"...","durationMinutes":90}` → `slots[]`를 KST 시각으로 group by. 반얀 주소 `addressId=12053`. ⚠️ `durationMinutes`를 고정하지 않으면 개수가 달라진다. 또 같은 조건 재조회 시 **개수는 같고 `detailerId`는 바뀐다**(동시각 후보 여럿이면 랜덤 1명 dedupe) → **"누가 열었나"는 이 응답으로 판정 금지, 사람은 work-day API로.**
 
 **🔴 디테일러 일부하 비교는 건수만으로 하면 틀린다 — 개인 근무창을 반드시 함께 조인 (2026-07-27 이승제 6건 항의 실사례)**
@@ -1218,12 +1250,14 @@ JOIN reservation_draft d
 
 **신규/복귀 디테일러 스케줄 생성 (활성 스케줄 0건인 경우)**
 - 🔴🔴 **반대 경우가 더 위험하다 — 파견자가 파견기간에 `DEFAULT` 스케줄을 *동시에* 들고 있을 수 있다 (2026-09-04 실사고).** 위 항목("0행일 수 있다")만 알고 있으면 파견자에게 DEFAULT가 없다고 전제하는데, 겹쳐 있으면 **셔플이 그를 일반 존 인력으로 보고 원존 예약을 꽂는다.** 실사례: 천호 파견자 정순욱187·박현규207·한수용191에게 `DEFAULT` 스케줄(id 1082·1091·1084, `CELL_SHARED` 룰)이 **9/8 00:00 KST~2099 무기한**으로 새로 생성됐는데 `HD_CHEONHO` 편성(187 ~9/10 · 207 ~9/8 · 191 9/9~9/10)이 그대로 살아 있어 기간이 겹쳤다. 그 상태로 대량 재배정이 돌자 **천호 예약 15/30건이 남에게 나가고 일반 존 예약 7건이 파견자에게 들어와** 파견지 슬롯을 물리적으로 막았다(정순욱 9/10 = 여의도 10:00·옥수동 12:00·잠원동 16:00 + 천호 10:30·12:30·16:30).
-  - **원인은 편성 화면이다.** `segment.ts`의 `SegmentWorkSite` 유니온에 `HD_CHEONHO`가 없어 편성 UI가 그 사람의 현장 편성을 **보지 못하고** DEFAULT를 새로 얹는다(`assertEditableSchedules`는 현장 편성 *편집*만 막고 새 DEFAULT *생성*은 막지 않는다).
+  - **원인은 편성 화면이다.** `segment.ts`의 `SegmentWorkSite` 유니온에 `HD_CHEONHO`가 없어 편성 UI가 그 사람의 현장 편성을 **보지 못하고** DEFAULT를 새로 얹었다(`assertEditableSchedules`는 현장 편성 *편집*만 막고 새 DEFAULT *생성*은 막지 않는다).
+    - ✅ **정정 (2026-09-08): 편성 화면은 이제 천호를 읽는다** — zero **#1825**(`dc3dcbe08`)가 `LEGACY_FIELD_WORK_SITES = ['HD_CHEONHO']`를 넣어 `FIELD:<현장키>` 형식과 함께 `isFieldSegmentWorkSite()`로 인식한다. ⟹ "파견 나간 사람이 화면에서 빈칸으로 보인다"는 더 이상 사실이 아니다. **다만 위 9/4 사고로 이미 생긴 겹친 DEFAULT 토막은 코드 수정으로 사라지지 않는다** — 감사 쿼리는 그대로 필요하다.
   - ⟹ **파견 감사 진입 쿼리는 `type` 을 필터하지 말고 그 사람의 그 기간 스케줄을 전부 펼쳐라.** `WHERE detailer_id=? AND effective_to > :from` 로 뽑아 **토막이 시간축에서 겹치는지**부터 본다. `type='HD_CHEONHO'`만 뽑으면 겹친 DEFAULT가 안 보이고, `type='DEFAULT'`만 뽑으면 파견 사실이 안 보인다.
   - ⚠️ 겹침 판정 시 `effective_from`/`effective_to`는 **UTC 저장 + KST 하루 경계**다(`(D-1) 15:00:00` ~ `D 14:59:59`). `9/8 00:00 KST` = `2026-09-07 15:00:00`.
   - 🔑 **관례는 "파견기간엔 DEFAULT를 비운다"이고 이건 실측으로 닫혀 있다 (2026-09-04).** 8월 반얀 파견 토막 **40개 전수에서 살아있는 DEFAULT(`effective_from <> effective_to`) 겹침이 0건 = 0%**다. 반대로 **종일 휴무로 막는 것은 관례가 아니다** — 같은 44토막 중 종일 휴무가 있는 건 36%뿐이고 내용이 전사휴무·연차·일회성 차단 요청이다. ⟹ 파견자에게 원존 예약이 새는 것을 막을 때 **휴무를 걸지 말고 DEFAULT 토막의 경계를 옮겨라.**
   - 🔴 **현장 파견자에게 종일 휴무를 걸면 그 현장 예약이 전부 "휴무자 배정"으로 잡힌다.** 휴무충돌 감사·재배정 예외 조항은 `type LIKE 'BANYAN%'`에만 걸려 있어(위 §휴무 윈도우) **천호는 예외가 아니다.** 천호 30건에 걸면 30건이 통째로 감사·재배정 대상이 된다.
   - 🔴🔴 **`PUT /v1/admin/scheduling/detailers/{id}/segments`는 현장 파견자에게 쓸 수 없다 (2026-09-04 `preview`로 실측).** 이 API는 `from`~`to` **창의 세그먼트를 통째로 교체**하므로, DEFAULT만 지우려고 창을 비우면 **그 창에 있는 `HD_CHEONHO` 편성까지 사라진다** → `coverProposals` 38건이 뜨고 그중 `origin:'NEW'` 15건이 **그 사람의 천호 예약 전부를 다른 디테일러로 되돌린다**(나머지 23건 `origin:'STANDING'`은 무관한 남의 예약 연쇄 — [[project_schedule_change_reservation_cover]]). 그렇다고 payload 에 천호 세그먼트를 되살릴 수도 없다: `place`가 **`zoneId` 필수(number)** 인데 천호 룰은 `zone_id=NULL`이라 `400 Invalid request body`다. ⟹ **파견 편성의 경계 이동은 `~/claude/mysql-write.sh`로 `effective_from`/`effective_to`만 UPDATE**하는 게 유일한 경로다(예약을 안 건드리니 cover 연쇄가 없다).
+    - 🔴🔴 **정정·강화 (2026-09-08): 이제 저장 자체가 400으로 막힌다. 그런데 `preview`는 안 막힌다 — 가드가 비대칭이다.** zero **#1825**(`dc3dcbe08`)가 `assertEditableSchedules`에 ⓪ 분기를 넣어, 편집 범위에 현장 편성이 **하나라도** 있으면 `현장 파견 근무는 구간 편집으로 다룰 수 없습니다: HD_CHEONHO` **BAD_REQUEST**를 던진다. 가드 호출부는 `prisma-detailer-segment.repository.ts`의 **`replaceSegments` 한 곳뿐**이고, 이건 실제 저장(`apply-detailer-segments`) 경로다. **`preview` 경로에는 이 가드가 없다** — 그래서 위 9/4 실측에서 `coverProposals` 38건이 떴던 것이고, 지금 다시 돌려도 똑같이 뜬다. ⟹ **`preview`가 응답했다는 것을 "이 편집이 된다"의 근거로 쓰지 말 것.** 현장 파견자에게는 preview가 그럴듯한 계획을 그려주고 저장에서 400이 난다.
     - ⚠️ 이때 `detailer_work_schedule`·`_rule`의 `created_at`/`modified_at`은 **UTC 저장**인데 컬럼 DEFAULT는 서버 tz(`Asia/Seoul`)라, INSERT에서 기본값에 맡기면 형제 행보다 **9시간 미래**로 박힌다 → `UTC_TIMESTAMP()`를 명시할 것(`reservation_status_log`와 같은 함정).
     - 🔑 **잘라낸 꼬리를 되살리는 것을 잊지 말 것.** `effective_to`를 당겨 파견기간을 비우면 파견 종료 후가 통째로 빈다 → 그날부터 예약이 안 들어온다. 새 토막 + 룰 복제(`INSERT ... SELECT LAST_INSERT_ID(), r.* FROM ..._rule r WHERE r.schedule_id = <원본>`)까지 한 트랜잭션에 넣는다.
   - 🔑 **겹침 여부는 어드민 API가 직접 알려준다** — `GET /v1/admin/scheduling/detailer-schedules/day?date=…`의 `fieldDeployment`(현장) × `hasNonFieldWork`(비현장 근무 보유). **`fieldDeployment != null && hasNonFieldWork == true` 가 곧 이상 신호**이고, 정상화되면 그날 `workScheduleTypes`가 현장 타입 단독 + `workZoneIds: []`가 된다. 수정 전후 검증에 이걸 쓸 것.
@@ -1341,6 +1375,9 @@ JOIN reservation_draft d
   - 이 끝시각 검사는 **셀 배정 경로에만** 있고 그 경로는 **예약 날짜가 2026-09-08 00:00 KST 이후일 때만** 켜진다(`COMMON_ZONE_RUNTIME_CUTOFF`). 그 전 날짜는 옛 경로로 가고 옛 경로는 예약 겹침만 봐서 근무창 초과를 허용했다 → **"어제까진 되던 18시가 오늘부터 안 된다"의 원인.**
   - 재현: `GET /v1/scheduling/detailers/available-at?addressId=..&startAt=..&durationMinutes=..`를 60과 실제 소요분 두 값으로 쳐서 `NO_FREE_INTERVAL`이 갈리는지 본다. 무인증.
 - 🔑 **"같은 시각인데 어떤 땐 되고 어떤 땐 안 된다"의 재구성 정본 = `time_slot_result_log.detailer_id`.** 같은 주소·같은 시각이라도 **조회할 때마다 묶이는 디테일러가 바뀐다**(실측: 8/12 08:00이 17:04 조회 한수용 → 17:08 조회 정순욱). 겹침 검사는 **디테일러 축**이므로 결과가 갈린다. 조사 순서 = ①`time_slot_request_log`에서 해당 시각대 요청 찾기 ②`result_log`에서 문제 슬롯의 `detailer_id` 확인 ③그 디테일러의 같은 날 예약과 `estimated_time`으로 겹침 재현. `reservation`만 봐서는 "왜 실패했는지"가 안 나온다(실패는 롤백돼 흔적이 없다).
+- 🔴🔴 **`days_to_first_slot`은 `from_date` 창을 안 좁히면 정반대 답이 나온다 (2026-09-09 실사고).** 앱은 고객이 **달력을 넘긴 달**도 그대로 조회하므로 `from_date`가 오늘이 아닌 로그가 섞인다. 그걸 그대로 `MIN(time_slot) - 요청일`로 재면 "첫 슬롯까지 평균 29일 · 72%가 7일 초과"가 나와 **"그 지역은 예약이 안 된다"는 결론**이 나온다. 같은 30일을 `l.from_date <= 요청일+1`로 좁히면 **2일 내 슬롯 노출 80.8%(84/104) · 슬롯 0건 요청 0건**으로 뒤집힌다.
+  - ⟹ 가용성 지표는 **반드시 `from_date` 필터를 먼저 걸고**, 남은 n을 함께 보고할 것(좁히면 표본이 1/4로 준다: 1,684 → 378).
+  - 참고: `slots_within_3days`(요청일~+2일 노출 슬롯 수)는 창 필터 없이도 방향이 맞는다 — 절대 개수라 조회창 시작점에 덜 민감하다.
 - 존 배정은 `address_id → user_address` 좌표 → `ST_Contains`(§2f). `zone_id` 컬럼은 커버가 75%라 전 기간 분석엔 좌표 판정이 안전.
 - **어드민 화면이 이미 있다**: `/admin/map` = 슬롯 수요 지도(날짜별 존별 요청 수 + 근무 디테일러 수 + 폴리곤). zero PR #577, 2026-06-18 배포. 존 수급 질문에 새 도구를 만들기 전에 이걸 먼저 볼 것.
 - ⚠️ **존별 인원·캐파를 셀 때 `dws.type='DEFAULT'` 필터를 넣어라.** 반얀 파견 스케줄의 rule도 `zone_id=8`이라 Z9로 합산돼 인원이 과대 집계된다(13명 중 6명이 반얀 상주 = 실효 7명). 위 대시보드 패널 12·15도 이 왜곡이 있다.
@@ -1526,7 +1563,9 @@ SELECT DATE(date) AS dt, SUM(cost) AS total_cost FROM (
 
 - ⚠️ **`= 'FACE_TO_FACE'`만 쓰면 2025-04 이전 구간에서 대면이 과소집계된다.** 전 기간 분석은 `IN ('FACE_TO_FACE','FACE_TO_FACE_EXPLAIN')`.
 - ⚠️ **대면율 분모는 `COUNT(*)`가 아니라 `crm_type IS NOT NULL`** — NULL 2.3%를 비대면으로 밀면 대면율이 낮게 나온다.
-- 조인: `LEFT JOIN wash_result wr ON wr.reservation_id = r.id` (완료 전 예약엔 row 없음). 세차범위별로 보려면 같은 §6d의 「세차범위 집계 = service_id 격자」와 교차.
+- 조인: `LEFT JOIN wash_result wr ON wr.reservation_id = r.id` (완료 전 예약엔 row 없음). `deleted_yn=0`을 걸 것 — 세차 재시작 시 옛 행이 soft delete로 남는다.
+- **컨시어지 케어 건의 "세차 후 대면"은 `crm_type`으로 본다**(케어 흐름에선 안내 방식 = 대면 안내 `FACE_TO_FACE` / 전화 안내 `ON_CALL`). 같은 뜻의 두 번째 기록 = `wash_completion_communication_context.payload` JSON `$.handoverMode`(`FACE_TO_FACE`/`CONTACTLESS`, `wash_result_id`로 조인, 최신 id 1행). 2026-09-08 실측 13건 전부 둘이 일치 — 둘 중 하나만 쓰면 되고 crm_type이 전 기간 커버라 우선.
+- 🔴 **"세차 전 대면(미팅)"은 서버에 남는 컬럼이 없다 (2026-09-08 코드 확인).** 디테일러가 세차 시작 때 고르는 `pre_wash_meeting`은 `wash_result.status` 초깃값(`CONCIERGE_CARE/MEETING_REQUEST`)으로만 들어가고 진행하면 덮어써진다(`max_status`도 그 단계가 맨 앞이라 안 남음). 유일한 흔적 = `wash_result_audio.type='PRE_WASH_CONVERSATION'` 행 유무(미팅 화면 녹음). 녹음을 안 하면 미팅이 있어도 0으로 보이는 **하한 추정치**다. 세차범위별로 보려면 같은 §6d의 「세차범위 집계 = service_id 격자」와 교차.
 - 🔑 **실측 시그널(2025-08~2026-08, 1회권·live_users)**: 대면율은 **세차범위가 회차보다 크게 좌우**한다 — 외부+내부 첫 세차 2,214/4,615 = **48.0%** vs 외부만 191/879 = **21.7%**(2.2배). 내부 세차는 차 안 접근이 필요해 키 전달·입회가 물리적으로 발생. 회차가 늘면 둘 다 감소(외부+내부 6회차+ 30.2% / 외부만 11.7%). **"대면 접점이 있는 세그먼트"를 정의할 때 회차만 보면 틀린다.**
 
 **세차 회차(n번째 세차) 매기기**
@@ -1778,6 +1817,9 @@ CRM·트랜잭션 메시지 발송 기록 테이블.
 - ⚠️ **한 방에 디테일러가 2명 들어간 방이 있다**(실측 room 80·81·82). "방의 DETAILER = 담당자"로 가정하지 말고 **발신자(`sender_participant_id`) 기준**으로 셀 것.
 - **셀장이 보낸 것만 세려면** `cell_membership`으로 좁힌다 — `detailer` 테이블엔 셀장 컬럼이 없다. 판정 규칙은 §3a 셀장 판정 주의사항(최신 행 하나 → role 확인)을 그대로 따를 것. 2026-09-08 시점엔 사람별 유효 행이 1개씩이라 `role='LEADER'` 선필터와 결과가 같았지만, 겹침이 생기면 갈린다.
 - 시각 필터는 `created_at` **UTC 저장** — "오늘(KST)"은 `created_at >= '<어제> 15:00:00'`처럼 UTC 경계로 주고, `DATE(created_at)=CURDATE()`는 쓰지 말 것(§5a).
+- 🔴 **예약에서 방으로 가는 조인이 없다 — `chat_room`엔 `reservation_id`도 `user_id`도 없다** (컬럼 = `id`·`name`·`created_at`·`modified_at`·`deleted_at`, 2026-09-09 실측). 컨시어지 케어 지정 건은 marker JSON이 유일한 경로다: `reservation_metadata` `key='concierge_care'` → `$.notification.roomId` = 그 지정의 안내 채팅방(`$.notification.messageIds` = 인사 채팅 `chat_message.id` 배열, `$.notification.status='SENT'`가 발송 완료). 지정 건이 아니면 `chat_participant`에서 `participant_type='USER'` + `participant_id=app_user.id`로 역추적할 수밖에 없다.
+- ⚠️ **`chat_message.created_at`은 초 단위(`DateTime(0)`)다 — 밀리초 타임스탬프와 `>=`로 비교하면 같은 초 메시지가 통째로 빠진다.** marker `$.markedAt`(`...T06:30:13.376Z`) 이후 채팅만 세면, 지정 직전에 나간 인사 채팅이 같은 초(`06:30:13`)에 찍혀 사라진다(2026-09-09 실측: 오늘 대상 17건 중 9건이 이렇게 메시지를 잃고 2건은 대화가 통째로 0건이 됐다). 초로 절삭한 하한을 쓸 것. 같은 초 안의 순서는 `id` 오름차순이 정본이다.
+
 
 ---
 
@@ -1905,6 +1947,9 @@ JOIN car c ON c.id = rc.car_id AND c.deleted_yn = 0
 - `key='admin/walk-in'` = 현장접수(워크인), `key='admin/call'` = 콜콘솔 컨시어지, 둘 다 없으면 고객앱. **워크인만 세면 콜콘솔분이 통째로 빠진다.**
 - 워크인 value JSON에 **`intakeChannel`**(`FIELD_SALES`/발렛/직접방문) + **`fieldSalesDetailerId`·`fieldSalesDetailerName`** = 현장영업 실제 영업자. 접수 계정(`sales.partnerId`)은 반얀 공용 `오퍼레이터`라 영업자 특정에 못 쓴다 — **"누가 팔았나"는 이 필드가 정본**.
 - `key='partner'` / `key='partnerReason'` = 제휴처·VIP 예약 판정 결과(라벨과 판정 근거). **제휴 예약을 세는 정본이 여기다** — 쿠폰·utm으로 역산하면 판정 규칙과 어긋난다. 예약 생성 시점에 쓰이는 게 원칙이고, 구독 자동예약처럼 생성 이펙트를 안 타는 건은 세차 **D-1 20시 크론**(`partnerVipDailyDigest`)이 사후에 채운다 ⟹ 두 시각대가 섞여 있는 게 정상이다.
+- `key='concierge_care'` = **컨시어지 케어 지정 marker(셀장이 셀 스케줄에서 카드 단위로 지정)**. value JSON: `serviceDate`(지정 대상 세차일, KST 'YYYY-MM-DD')·`leaderDetailerId`(셀장)·`memberDetailerId`(수행 디테일러)·`cellId`·`actorPartnerId`·`markedAt`·`reason`·`trialRound`(1~3, 어드민 2·3회차 생성분만)·`source`(`ADMIN_FOLLOWUP`이면 어드민 생성). (2026-09-08 실측)
+  - **"셀장별 지정 건수"는 `reservation.detailer_id`가 아니라 marker의 `$.leaderDetailerId`/`$.memberDetailerId`로 센다** — 동행·재배정으로 예약 담당자와 다를 수 있다. 날짜 축은 `$.serviceDate`(18:00·22:00 컨시어지 다이제스트가 이 값으로 대상을 고른다). `reservation_datetime` KST 날짜와 어긋난 행이 실재하므로 리포트는 둘 중 하나를 명시하고 쓸 것.
+  - 🔴 **테스트 예약이 섞인다**: `key='admin/bulk-free-reservation'`(어드민 무료 일괄 생성)이 같은 예약에 공존하는 행 + `app_user.name LIKE '%테스트%'`. 2026-09-07 교육용 77건이 케어 지정된 채 CONFIRMED로 남아 있다(셀장 1명 계정으로 일괄 지정, `reason=''`). 케어 실적을 셀 때 §5b 3플래그로는 안 걸러진다 — 이 key 공존 여부로 뺄 것.
 - `key='banyan/strategy'` = 셀장이 쓴 판매 작전 텍스트(`{text, authorName, updatedAt}`).
   - 🔴 **수정 여부를 `modified_at`으로 판정하지 말 것 — 이 테이블은 갱신해도 `modified_at`이 안 변한다** (2026-08-17 실측: 43행 전부 `modified_at = created_at`). Prisma 모델에 `@updatedAt`이 없고 컬럼에도 `ON UPDATE`가 없다. 게다가 `(reservation_id, key)` unique 인덱스가 없어 저장 로직이 `findFirst`→`update`로 **같은 행을 덮어쓰므로 행 수도 안 늘어난다** → "아무도 수정 안 했다"로 오독한다.
   - **수정 판정 정본 = value JSON `updatedAt` vs `created_at` 비교**: `STR_TO_DATE(REPLACE(REPLACE(JSON_UNQUOTE(JSON_EXTRACT(value,'$.updatedAt')),'T',' '),'Z',''),'%Y-%m-%d %H:%i:%s.%f')`. 실측 43행 중 4행이 최대 **+972분** 뒤 수정돼 있었다(둘 다 UTC).
@@ -1996,6 +2041,8 @@ JOIN car c ON c.id = rc.car_id AND c.deleted_yn = 0
 
 - 🔴 **2026-08-17, 공용 계정(`operator` = partner 41, `detailer1`·`detailer2`)이 전부 `deleted_yn=1`로 정지되고 현장 인원이 개인 `MASTER_DETAILER` 계정으로 전환됐다**(username = 본인 휴대폰번호). ⟹ **allowlist에 없는 엔드포인트가 그 순간부터 전부 403**이 된다. 현장에서 "저장이 안 된다"고 오면 코드·배포보다 **먼저 `partner.role`을 조회**할 것(실사례: 반얀 판매 작전 저장 403, PR #1606).
 - 🔴 **디테일러도 어드민 권한 행을 갖는다 — "어드민 권한자"를 `partner`만 보고 세지 말 것 (2026-09-08 실측).** 지금 권한 판정의 정본은 role 표가 아니라 **`admin_partner_permission`**(`partner_id·resource·action`)이고, 가드는 그 행만 본다 — **`role='admin'`인지는 확인하지 않는다.** 게다가 `AdminPartnerJwtGuard`는 디테일러앱 토큰도 partner로 해석하므로(`partner.detailer_id` 연결) **디테일러가 어드민 API에 도달할 수 있다.** prod에 `detailer_id IS NOT NULL`인 partner가 72행이고 그중 여럿이 `SCHEDULE` 등 권한 행을 갖고 있다(셀장 본인 포함). 조회: `SELECT p.id,p.detailer_id,app.resource,app.action FROM partner p JOIN admin_partner_permission app ON app.partner_id=p.id`.
+- **"권한 A는 있고 B는 없는 계정"은 anti-join이다 (2026-09-08).** 권한이 `partner_id·resource·action` **행**이라 한 행 필터로는 안 나온다. `resource IN ('SCHEDULE','RESERVATION') AND action='WRITE'`로 세면 각각의 보유자 수만 나오고 교집합을 놓쳐 정반대 결론이 난다. 판정 = `SELECT ... FROM (A 권한 partner_id) a LEFT JOIN (B 권한 partner_id) b ON a.partner_id=b.partner_id WHERE b.partner_id IS NULL`. 실측(2026-09-08 prod): `SCHEDULE:WRITE` 21명 전원이 `RESERVATION:WRITE`도 보유 → 둘만 가진 계정 0명.
+- ⚠️ **dev에는 권한이 모자란 어드민이 없다 (2026-09-08 확인).** dev 어드민 partner 전원이 `SCHEDULE`·`RESERVATION` 전 권한을 갖고 있어, **권한 게이트 403을 dev에서 재현하려면 계정을 새로 만들거나 권한 행을 지워야 한다.** 기존 계정으로 시도하다 "게이트가 안 걸린다"고 오판하지 말 것.
 - ⚠️ **권한 변경은 재로그인해야 적용된다** — capability가 JWT 발급 시점에 박히므로 `role`만 UPDATE하면 기존 토큰은 그대로다.
 - 옛 서술 정정: "반얀 현장은 공용 오퍼레이터 계정이라 개인 특정 불가"는 **2026-08-17부터 성립하지 않는다** — `crm_note.partner_id`·`partner_activity_log.partner_id`로 개인이 특정된다.
 
