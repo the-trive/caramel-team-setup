@@ -1014,6 +1014,8 @@ WHERE us.user_id = ? AND us.deleted_yn = 0
 ```
 전체 규모(2026-07-31, 살아있고 미만료인 `user_service` 기준): 미사용 18,860 / 미래 CONFIRMED 선점 4,816 / 소진(WASHED) 35,248. **선점분이 실질 보유의 4,816÷23,676 = 20.3%** — 무시하면 CS 답변이 대량으로 틀린다.
 
+**🔴 화면의 "N장 보유"는 위 실질 보유와 다른 질문이다 — 차량 적용까지 통과해야 뜬다 (2026-09-10 코드+dev 실측)**: 콜 콘솔 세차권 목록과 고객 앱 `listMyWashTickets`가 말하는 "지금 이 차에 쓸 수 있는 보유분"은 더 좁다. ①쿼리 필터 = `deleted_at IS NULL AND deleted_yn=0 AND paid_yn=1 AND postpaid_yn=0 AND reservation_id IS NULL AND used_yn=0 AND (ended_at IS NULL OR ended_at > NOW())` — **후불(`postpaid_yn=1`)은 수금에 묶여 있어 보유로 세지 않는다.** ②그 다음 **차량 적용 조건**(`user_service_applicability.config`의 `CAR_ID`·`CAR_BRAND_ID`·`CAR_TIER_ID`·`CAR_REGISTERED_AT`·`CAR_MILEAGE` 필터 대 그 차의 값)을 통과한 것만 남는다. ⟹ **SQL로 행만 세고 화면을 예측하면 어긋난다** — dev에서 위 필터로 5장·2장이 잡힌 고객이 콜 콘솔엔 "보유" 표시가 하나도 없었다(그 차가 적용 대상 밖). 정본 = caramel-zero `listOwnedUserServiceGroups`(`prisma-admin-wash-pass-products.repository.ts`) → `selectApplicableOwnedUserServices`. 표시와 실제 소진이 같은 함수를 쓰도록 묶여 있으므로, "왜 화면엔 안 뜨냐"는 문의도 이 두 단계로 갈라서 답할 것.
+
 ### 5c-2. 🔴 세차 1건이 "무엇으로 결제됐나"(세그먼트) 판정 — `paid_yn`으로는 못 가른다 (2026-08-18 실측)
 
 "이 달 세차를 구독/1회권/제휴/무료로 쪼개라"는 요청의 정본 축은 **예약에 물린 `user_service` 1행**이다(`us.reservation_id = r.id AND us.deleted_yn = 0`). 판정 순서:
