@@ -521,6 +521,38 @@ JOIN zone z ON z.id = r.zone_id     -- ⚠️ service_zone 테이블 없음 — 
 - ⚠️ **이름이 겹친다.** `Z5`가 id 5(`Z5 (서초구/용산구)`)와 id 24(`Z5 동남`) 둘, `Z3`·`Z6`도 마찬가지다. **사람에게 말할 때도 `zone.name`을 통째로 인용**하고 "Z5"로 줄이지 말 것.
 - ⟹ 위 §"공동구역은 `zone` 테이블에 없다"(2026-08-20)는 **더는 사실이 아니다.** 셀은 이제 `zone` 테이블 id 14~19에 폴리곤으로 들어와 있어 `ST_Contains`로 직접 판정된다. `zone6_areas.geojson`은 이 체계 이전 근사치다.
 
+### 3b-2. 셀·존·리더·멤버 — 개념과 예약 배정 검증 규칙 (2026-09-10, dev 실측 + `scheduling` 도메인 코드)
+
+한 문장씩. **존(`zone`)** = 지도 위 폴리곤(`area`, `kind`). **셀(`cell`)** = 디테일러 묶음(`code` Z1~Z6). **`zone_cell_assignment`** = 어느 존을 어느 셀이 맡나(effective 창). **`cell_membership`** = 누가 어느 셀에 어떤 `role`(LEADER/MEMBER)로 있나(effective 창). 리더 = 셀장(권한·동행·지정 주체), 멤버 = 실제로 예약을 받는 사람.
+
+**예약을 디테일러 X에게 붙일 때 서버가 검사하는 것** (`prisma-scheduling-assignment-validator.repository.ts` → `cell-topology.ts`). 어드민 예약생성·고객 예약·재배정 API 전부 같은 검증을 탄다(`COMMON_ZONE_RUNTIME_CUTOFF` 이후 예약에 한정).
+1. 주소 → 존: `user_address.latitude/longitude`로 `ST_Contains(zone.area, POINT)` + `kind IN ('CELL_EXCLUSIVE','CELL_SHARED')` + effective 창. `service_region_id`는 존 판정에 안 쓴다(현장 파견 판정용).
+2. 존 → 셀: `zone_cell_assignment`에서 그 시점 유효한 셀. **전담존(`CELL_EXCLUSIVE`)은 셀 정확히 1개, 공용존(`CELL_SHARED`)은 정확히 2개** — 아니면 `UNHANDLED "Zone-cell assignment cardinality is invalid"`.
+3. 각 배정 셀에 **LEADER가 정확히 1명** 있어야 한다 — 아니면 `UNHANDLED "Assigned cell leader cardinality is invalid"` (dev 셀 15 Z3에 리더 0명이라 실제로 맞았다).
+4. 그 존의 배정 셀들에서 **X는 셀 1개에만** 속해야 한다 — 두 셀에 동시 소속이면 `UNHANDLED "Detailer has overlapping effective memberships"`. 검사 범위는 **그 존을 맡은 셀들만**이다(전혀 다른 존의 셀에 또 속한 건 안 본다).
+5. 🔴 **X는 그 셀의 `role='MEMBER'`여야 한다. LEADER는 예약을 받을 수 없다** → `CONFLICT "선택한 디테일러는 예약할 수 없습니다."` 셀장이 세차를 하는 길은 `cell_accompaniment`(동행)·컨시어지 지정(`reservation_metadata key='concierge_care'`의 `leaderDetailerId`)이고, `reservation.detailer_id`는 여전히 멤버다(§위 3 항목 참조).
+6. 고객이 **SA 등급이고 존이 `CELL_SHARED`** 면 X에게 `detailer_qualification(qualification_code='CONCIERGE_CARE', status='QUALIFIED')`가 있어야 한다. 전담존·일반 고객엔 자격 무관.
+7. `detailer.booking_yn=1 AND retired_yn=0 AND deleted_yn=0`.
+
+**시험 계정으로 예약을 넣을 때의 함정**: 셀장 테스트 계정(dev 183 = 셀 14 Z2 LEADER)엔 위 5번 때문에 일반 예약이 안 붙는다. 같은 셀에 MEMBER 행을 하나 더 넣으면 4번(같은 셀이 두 번 = 겹침)에 걸린다. **셀 14와 존이 겹치지 않고 LEADER가 1명 있는 다른 셀에 MEMBER로 넣고, 그 셀 전담존 안 주소를 써야** 통과한다(dev: 셀 16 Z4 + 존 25 마곡 주소로 성공). 멤버십을 쓰는 어드민 API는 없다(파일럿 시드 코드만) → DB 행 삽입.
+
+**쿼리 뼈대**
+```sql
+-- 이 시점에 존 Z를 맡은 셀과 그 셀의 리더/멤버 수
+SELECT zca.cell_id, c.code,
+       SUM(cm.role='LEADER') leaders, SUM(cm.role='MEMBER') members
+FROM zone_cell_assignment zca
+JOIN cell c ON c.id=zca.cell_id AND c.deleted_at IS NULL
+LEFT JOIN cell_membership cm ON cm.cell_id=zca.cell_id AND cm.deleted_at IS NULL
+  AND cm.effective_from <= @at AND (cm.effective_to IS NULL OR cm.effective_to > @at)
+WHERE zca.zone_id=@zone AND zca.deleted_at IS NULL
+  AND zca.effective_from <= @at AND (zca.effective_to IS NULL OR zca.effective_to > @at)
+GROUP BY 1,2;
+```
+- `@at`은 **예약 시각(UTC)** 이다. 지금 시각으로 보면 미래 개편분이 빠진다.
+- ⚠️ dev의 `zone.id`는 prod와 다르다(dev: 공용 16~21, 전담 22~27 / prod: 공용 14~19, 전담 20~25). 이름(`zone.name`)으로 맞춰라.
+- 위 §"`role='LEADER'`로 먼저 거르면 옛 셀장이 섞인다" 규칙은 여기서도 그대로다 — 사람 단위 판정은 최신 행 하나를 고른 뒤 role을 본다.
+
 ### 3c. 재배정 후보 탐색 — "이 존 외 건, 누구로 바꿀 수 있나" (2026-07-26)
 
 §6b의 사전검증은 **이미 고른 대상을 검사**하는 절차다. 후보를 **찾는** 건 별개이고, 순서를 틀리면 "교체 불가"라는 오답이 나온다.
@@ -938,6 +970,37 @@ WHERE us.reservation_id IS NULL OR r.id IS NULL
 - ⟹ **점유율·믹스·객단가는 완료(`WASHED`/`REPORT_SENT`) 기준으로 센다.** 미래 예약은 "지금 달력에 무엇이 잡혀 있나"에만 쓰고, 그 비율을 최종 구성으로 인용하지 말 것.
 - 🔴 미래 예약 건수는 날짜가 멀수록 급감한다(2026-09-09 기준: 9월 2,224 · 10월 1,987 · 11월 690 · 12월 219). **먼 달의 낮은 건수를 "수요 감소"로 읽지 말 것** — 예약 지평선 산물이다.
 
+
+### 4b-18. 🔴 완료세차의 `washed_at`이 2026-07부터 비어 있는 비율이 급증했다 (4.6%→8.8%, 2026-09-10 실측)
+`status IN ('WASHED','REPORT_SENT')`인데 `washed_at IS NULL`인 건이 2026-06 0.05% → 07 4.6% → 08 8.8%(314/3,576). 후불 예약이 아니다(11건만). 원인 미상.
+- 완료 시점·버킷·순번(ROW_NUMBER)은 **`COALESCE(washed_at, reservation_datetime)`** 로 잡는다. `washed_at IS NOT NULL` 필터를 걸면 완료건 8.8%가 분모에서 사라지고, 첫 세차가 결측인 유저는 2번째 세차가 rn=1로 잡혀 재구매가 신규로 오분류된다(첫세차완료 −23% 실측).
+- 같은 이유로 "8월 세차완료수"가 SQL마다 3,563(reservation_datetime) vs 3,256(washed_at)으로 갈렸다. CBR 보드는 2026-09-11부터 전부 COALESCE.
+
+### 4b-19. 🔴 광고비 테이블은 채널별 적재 상한(MAX(date))을 먼저 확인하라 — `meta_daily_performance`는 2026-07-06에 멈췄다 (2026-09-10 실측)
+`meta_daily_performance` 마지막 행 2026-07-06(KST). 그런데 Meta utm 유입 가입은 8월에도 주 20~29명 → 광고 중단이 아니라 **적재 중단**(쓰는 GAS가 마케터 개인 계정, `marketing-gas-live`에는 이 테이블을 쓰는 함수가 없다). 3채널 합산 광고비·CAC 전부가 7월부터 −37% 과소, "효율 개선" 착시.
+- 채널 시작일도 다르다: `naver_daily_performance` 2026-03-17~, `google_daily_performance` 2026-04-30~. 그 전 월간 광고비는 Meta 단독값.
+- 광고비 합산 전 `SELECT MAX(date) FROM <각 채널 테이블>` 3줄을 먼저 친다.
+
+### 4b-20. `detailer_supply_sheet.status` 실값 = 퇴사·현직·하차·삭제·파견·타부서 — '교육중'은 없다 (2026-09-10 실측)
+`status IN ('현직','교육중','퇴사')` 화이트리스트는 '하차' 23명(교육·근무 시작일 전원 기록됨)을 버려 교육/근무 시작 디테일러가 44% 누락됐다. 채용 페이스는 status 필터 없이 `training_start_date`/`work_start_date IS NOT NULL`만(제외는 '삭제'만).
+
+### 4b-21. `zone` 테이블에 구세대(Z1~Z17)·CELL_SHARED·신세대(Z1~Z6, `kind='CELL_EXCLUSIVE'`)가 공존한다 — ST_Contains는 한 세대만 (2026-09-10 실측)
+필터 없이 `ST_Contains(zone.area, POINT)`로 붙이면 세차 1건이 평균 1.96개 zone에 귀속(10,790건→21,127). 현행 = `kind='CELL_EXCLUSIVE' AND deleted_at IS NULL AND effective_from<=NOW() AND (effective_to IS NULL OR effective_to>NOW())`. 같은 세대 안에서도 경계 겹침 4건이 있어 `ROW_NUMBER() OVER (PARTITION BY 예약 ORDER BY zone.id)`로 1건=1zone을 강제한다. 신세대 폴리곤은 구세대보다 좁아 커버리지 72%(나머지는 zone 밖).
+
+### 4b-22. `complaint_log`는 CS 시트 동기화라 접수일이 최대 7일 뒤처지고 `user_id`/`reservation_id`가 없다 (2026-09-10 실측)
+컴플레인율 분자(접수일)와 분모(완료세차, 실시간)를 그대로 나누면 최근 버킷이 3배 과소. 분모 상한을 `MAX(received_date)`로 맞춘다. 분자엔 live_users 필터를 걸 수 없다(유저 키 없음).
+
+### 4b-23. 컨시어지 케어는 `subscription`에 전용 플랜이 없다 — 표식은 `reservation_metadata.key='concierge_care'` (2026-09-10 실측)
+상품명에 '컨시어지'가 든 product에 연결된 subscription 0건, 189,000원 결제 0건. 뒤에 붙은 구독은 기존 '월 2·4회(외부만)' 4주 플랜이라 플랜별 churn·상품유형 믹스에서 분리되지 않는다. 플랜 축이 필요하면 `reservation_metadata`(2026-09-04~, 예약 173건·65명)로 차원을 따로 붙인다.
+
+### 4b-24. `subscription.paused_at`은 재개해도 NULL로 돌아가지 않는다 — 분모 필터로 쓰지 마라 (2026-09-08 실측)
+289건 중 80건(27.7%)이 재개 후에도 잔존. churn 분모에 `paused_at IS NULL`을 걸면 정상 이용 구독 15%가 빠져 churn이 2pp 과대. 활성 경계 표준 = `status IN('ACTIVE','STOPPED','STOPPPED','ENDED') AND deleted_yn=0`, 종료시각 `CASE WHEN status IN('STOPPED','STOPPPED','ENDED') THEN COALESCE(stopped_at,ended_at) ELSE NULL END`, paused 포함·CREATED 제외.
+
+### 4b-25. 온보딩 코스 상품은 `product.name LIKE`로 잡지 마라 — 신상품이 누락·오라벨된다 (2026-09-10 실측)
+'라이트%/베이직%/장마%' 3패턴은 2026-08-18 「폭염 도장 보호 코스」(4077~4082, 30일 20%)를 통째로 빼고, 2026-09-07 「장마 흔적 지우기 코스」(4094~4096)를 '장마 대비 풀코스'에 합산한다. 판별은 `payment.metadata.onboardingFlow='onboard-v3'`(선불) ∪ `reservation_onsite_collection`(후불), 라벨은 product.name에서 티어 접미를 뗀 코스명.
+
+### 4b-26. `payment.cancel_amount`에 음수가 있다 (138건·−313만원, 최근 12개월, 2026-09-11 실측)
+PARTIAL_CANCELED 비례차감 때 그대로 빼면 매출이 **올라간다**. `GREATEST(cancel_amount,0)`으로 절삭. 음수의 뜻(추가 청구? 오류?)은 확인 필요. `status='PAID'`인데 `cancel_amount>0`인 결제도 6건 있다.
 
 ## 5. 공통 패턴
 
