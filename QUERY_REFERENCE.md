@@ -972,7 +972,7 @@ WHERE us.reservation_id IS NULL OR r.id IS NULL
 
 
 ### 4b-18. 🔴 완료세차의 `washed_at`이 2026-07부터 비어 있는 비율이 급증했다 (4.6%→8.8%, 2026-09-10 실측)
-`status IN ('WASHED','REPORT_SENT')`인데 `washed_at IS NULL`인 건이 2026-06 0.05% → 07 4.6% → 08 8.8%(314/3,576). 후불 예약이 아니다(11건만). 원인 미상.
+`status IN ('WASHED','REPORT_SENT')`인데 `washed_at IS NULL`인 건이 2026-06 0.05% → 07 4.6% → 08 8.8%(314/3,576). **원인 = 어드민·반얀 밸릿 보드가 쓰는 `updateAdminReservation`(zero api)이 status만 WASHED로 바꾸고 `washed_at`을 안 씀**(8월 NULL 315건 전부 `reservation_change_log reason=ADMIN_RESERVATION_UPDATE`, 90%가 반얀트리 주소). 디테일러앱 완료 경로만 채운다.
 - 완료 시점·버킷·순번(ROW_NUMBER)은 **`COALESCE(washed_at, reservation_datetime)`** 로 잡는다. `washed_at IS NOT NULL` 필터를 걸면 완료건 8.8%가 분모에서 사라지고, 첫 세차가 결측인 유저는 2번째 세차가 rn=1로 잡혀 재구매가 신규로 오분류된다(첫세차완료 −23% 실측).
 - 같은 이유로 "8월 세차완료수"가 SQL마다 3,563(reservation_datetime) vs 3,256(washed_at)으로 갈렸다. CBR 보드는 2026-09-11부터 전부 COALESCE.
 
@@ -999,8 +999,8 @@ WHERE us.reservation_id IS NULL OR r.id IS NULL
 ### 4b-25. 온보딩 코스 상품은 `product.name LIKE`로 잡지 마라 — 신상품이 누락·오라벨된다 (2026-09-10 실측)
 '라이트%/베이직%/장마%' 3패턴은 2026-08-18 「폭염 도장 보호 코스」(4077~4082, 30일 20%)를 통째로 빼고, 2026-09-07 「장마 흔적 지우기 코스」(4094~4096)를 '장마 대비 풀코스'에 합산한다. 판별은 `payment.metadata.onboardingFlow='onboard-v3'`(선불) ∪ `reservation_onsite_collection`(후불), 라벨은 product.name에서 티어 접미를 뗀 코스명.
 
-### 4b-26. `payment.cancel_amount`에 음수가 있다 (138건·−313만원, 최근 12개월, 2026-09-11 실측)
-PARTIAL_CANCELED 비례차감 때 그대로 빼면 매출이 **올라간다**. `GREATEST(cancel_amount,0)`으로 절삭. 음수의 뜻(추가 청구? 오류?)은 확인 필요. `status='PAID'`인데 `cancel_amount>0`인 결제도 6건 있다.
+### 4b-26. `payment.cancel_amount`에 음수가 있다 (138건·−313만원, 2025-11~2026-03에만, 2026-09-11 실측)
+그 기간 구독 환불 경로의 부호 문제로 보인다(12월·1월은 음수만, 4월부터 전부 양수; `amount+cancel_amount`가 양수로 남음 → 값은 환불액). PARTIAL_CANCELED 비례차감은 **`ABS(cancel_amount)`** 로. 코드상 정상 경로는 하한 0을 지켜 원인은 미확정(다중결제 이중적용 또는 수동보정 추정). `status='PAID'`인데 `cancel_amount>0`인 결제도 6건 있다.
 
 ## 5. 공통 패턴
 
