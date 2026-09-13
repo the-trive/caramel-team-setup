@@ -197,6 +197,8 @@ TRIM(CONCAT(COALESCE(cb.name,''),' ',COALESCE(NULLIF(c.model,''), cm.name, '')))
 - ❌ `car_brand.target_yn`(수입차 브랜드 21개 단위)은 부정확 — 제네시스 G90·GV80 누락 + BMW 1시리즈·벤츠 A클래스 오포함.
 - `car_tier`(T1~T7)도 차 크기 기준이라 출고가 대리변수로 못 씀.
 - 뷰 `is_target=1` = 220개 모델(2026-06 기준).
+- 🔴 **`is_target=0`은 "비타겟"과 "가격표에 아직 안 들어간 신규 차종"을 구분하지 못한다 (2026-09-13 실측).** 뷰는 `car_price`를 LEFT JOIN해 `launch_price>=6500`을 보므로, `car_model`에 새 차종이 추가돼도 `car_price` 행이 없으면 조용히 0이 된다. 실측 13개 모델 미등록 — 캐딜락 에스컬레이드 ESV(실차 10대)·IQ·IQL, GMC 허머EV, 람보르기니 레부엘토·테메라리오, 애스턴마틴 발러가 전부 비타겟으로 떨어져 있었다. ⟹ "이 고가차가 왜 S/A가 아니냐"는 물음엔 먼저 `SELECT * FROM car_price WHERE model_id=?`로 **행 존재 여부**를 볼 것(`launch_price IS NULL`이면 미분류). 미등록 전수 = `SELECT cm.id,cm.name FROM car_model cm LEFT JOIN car_price cp ON cp.model_id=cm.id WHERE cp.model_id IS NULL`.
+- S/A 고객 판정 코드(zero `user-grade-signal.constants.ts` `isSaCustomer`) = **활성·비임시 보유차 중 `is_target=1` 1대 이상 OR 활성 `user_grade_signal.signal_type='VIP'`**. 차량이 미분류면 VIP 수동 지정 외엔 S/A가 될 경로가 없다.
 
 **⚠️ 타겟 "고객" 판별 3패턴 — 패턴에 따라 숫자가 다르다 (세컨카 포함/제외 차이)**
 - **패턴 A (세차 건)**: `reservation_car`→`car`→`car_model_target` — 세차한 그 차가 타겟인지. 타겟 유저가 비타겟 세컨카로 세차하면 제외됨.
@@ -625,6 +627,15 @@ GROUP BY s.detailer_id, d.name ORDER BY min_km;
   - 현장 예약 판정 = `user_address.address` 와 `field_site.addresses[*].address` **완전 일치**(천호 `'서울 강동구 천호대로 1005 (천호동)'`). `LIKE '%천호대로 1005%'`는 `1005번길` 이웃 주소가 섞인다.
   - 천호 파견 룰은 `service_region_group_id`·`zone_id` **둘 다 NULL** — zone 조인으로 후보를 세면 0명이다(반얀은 zone 8을 달고 있어 위 함정과 반대). 룰 시각 UTC `01:00~12:00` = KST 10:00~21:00, 경계는 `(D-1) 15:00:00`.
   - ⚠️ `detailer_work_schedule_rule.start_time/end_time` 은 **DATETIME** 이다(TIME 아님). 저장 원문 `1970-01-01 01:00:00` — INSERT 에 `'01:00:00'` 만 쓰면 `Incorrect datetime value` 로 실패한다(2026-09-10 실측). 헬퍼 JSON 은 `1969-12-31T16:00:00.000Z` 로 렌더한다(§5a −9h).
+  - 🔑 **"현장 주소로 예약 날짜가 하나도 안 뜬다" 는 대부분 버그가 아니라 편성 부재다 (2026-09-13 실측).** 현장 주소는 `workScheduleTypesForAddress()` 가 `DEFAULT` 대신 그 현장 타입으로 바꿔버리므로, **그 날짜에 그 현장 타입 근무 행이 없으면 슬롯이 0칸**이고 동네 담당(홈존) 디테일러는 배정 자체가 막힌다(`409 zoneId`). 진단 1순위 쿼리 =
+    ```sql
+    SELECT id, detailer_id, type, effective_from, effective_to
+    FROM detailer_work_schedule
+    WHERE type IN ('HD_CHEONHO')   -- §624 목록으로 IN
+      AND effective_from <= '<예약일 UTC>' AND effective_to >= '<예약일 UTC>';
+    ```
+    0행이면 "그날 그 현장에 사람이 없다" 가 답이다. 고객앱은 이유를 안 보여주고 빈 달력만 띄운다(서버는 `emptyReasonCode=NO_AVAILABLE_TIMELINE` 을 주는데 웹이 안 쓴다).
+  - ⚠️ **`field_site.ends_at` 은 고객 슬롯을 막지 않는다.** 이 값은 현장 보드·접수 화면의 날짜 범위만 자른다(`banyan-field` 도메인). 슬롯 조회는 `addresses` + `slot_config` + 근무 행만 본다 ⟹ **운영기간이 지난 현장도 근무 행만 넣으면 고객앱에 슬롯이 열린다.** 반대로 `ends_at` 을 늘려도 편성 없이는 한 칸도 안 뜬다.
 
 ### 3e. 디테일러 생산성 — 작업 소요시간·이동 간격 (2026-08-06 실측)
 
@@ -1300,11 +1311,13 @@ JOIN reservation_draft d
 | 13:00 | 22:00 |
 
 **실제 노출 슬롯 시각의 출처 (2026-07-13 확정) — ⚠️ caramel-api 파지 말 것**
-- 콜 콘솔·고객앱 예약 슬롯 = **caramel-zero `apps/api` `scheduling` 도메인의 하드코딩 상수** (`generate-time-slots.policy.ts`, zero-api `POST /v1/admin/scheduling/time-slots/query`). ⚠️ 레거시 caramel-api `time-slot.service.ts`(TARGET_TIMES 08·10·12…)는 죽은 경로 — 여기 파면 헛다리.
+- 콜 콘솔·고객앱 예약 슬롯 = **caramel-zero `apps/api` `scheduling` 도메인** (`generate-time-slots.policy.ts`, zero-api `POST /v1/admin/scheduling/time-slots/query`).
+  🔴 **출처가 갈렸다 (2026-08-30 승격, 2026-09-13 재확인).** 일반(DEFAULT) 그리드만 코드 상수(`SEOUL_SLOT_START_TIMES_UTC`)로 남았고, **현장 시각표는 `field_site.slot_config.startTimes` 가 정본**이다 — prod 코드에 `SEOUL_BANYAN_TREE_*`·`SEOUL_HD_CHEONHO_*` 상수는 **없다**. 아래 반얀·천호 항목의 상수 이름은 옛 서술이니 값 확인은 DB 로 할 것: `SELECT site_key, slot_config FROM field_site`. ⚠️ 레거시 caramel-api `time-slot.service.ts`(TARGET_TIMES 08·10·12…)는 죽은 경로 — 여기 파면 헛다리.
 - ⚠️⚠️ **반얀트리(BANYAN_TREE) 슬롯 ≠ 일반(DEFAULT) 슬롯 = 완전히 다른 시스템.**
   - **반얀트리**: 고정 상수 `SEOUL_BANYAN_TREE_SLOT_START_TIMES_UTC` → **KST 09·11·14·16·18** (반얀 주소=장충단로 60 매칭 시에만).
   - **반얀 확장(`BANYAN_TREE_EXTENDED`)**: 고정 상수 `SEOUL_BANYAN_TREE_EXTENDED_SLOT_START_TIMES_UTC` → **KST 08·10·12·14·16·18·20** (같은 반얀 주소, 7칸). 🔴 **반얀 근무자는 최근 사실상 전원 이 타입이라, 기본 `BANYAN_TREE` 그리드(09·11·14·16·18)로 "그 시각은 원래 없는 슬롯"이라고 판정하면 뒤집힌다** — 2026-09-01 실사례: 9/4 12시 미노출의 원인은 그리드 부재가 아니라 12시를 여는 오전조 3명 전원 예약 참. ⟹ 반얀 슬롯을 판정하기 전에 **그날 유효한 스케줄의 `type`을 먼저 뽑아** 어느 그리드인지 확정할 것.
-  - **현대백화점 천호(`HD_CHEONHO`)**: 고정 상수 `SEOUL_HD_CHEONHO_SLOT_START_TIMES_UTC` → **KST 10:30·12:30·14:30·16:30·18:30** (천호 주소=천호대로 1005 매칭 시에만). 2026-08 신설, 이 코드베이스 **최초의 30분 오프셋 그리드**다.
+  - **현대백화점 천호(`HD_CHEONHO`)**: **KST 10:30·12:30·14:30·16:30·18:00** (천호 주소=천호대로 1005 완전 일치 시에만). 이 코드베이스 **최초의 30분 오프셋 그리드**이고, **마지막 칸만 18:00 정각**이다.
+    🔴 **정정 (2026-09-13 실측): 종전 문서의 `18:30` 은 오기다.** prod `field_site.slot_config.startTimes.DEFAULT` 가 `18:00` 이고 9/10 슬롯 API 실측도 18:00 이었다. 18:30 으로 알고 "그 시각이 왜 안 뜨냐"를 파면 헛다리다.
   - 🔴 **그리드는 근무창에서 파생되지 않는다 — 타입별 코드 상수다** (`slotStartTimesForWorkScheduleType()`). 근무 rule은 그중 **몇 칸이 보일지만** 정한다. ⟹ 근무창이 KST 10~21이어도 천호는 5칸이지 11칸이 아니다. **새 현장 시각이 다르면 반드시 새 상수를 추가**해야 한다.
   - 🔴 **타입 문자열이 매핑 계층에서 조용히 `DEFAULT`로 치환될 수 있다 (2026-08-26 실사고).** `prisma-detailer-schedule.repository.ts`의 `toDetailerWorkScheduleType`이 **화이트리스트**라 여기 빠진 타입은 DB에 `HD_CHEONHO`로 있어도 `DEFAULT`로 읽힌다 → **파견자는 정확히 잡히는데 슬롯 시각만 일반 그리드(정각)로 뜬다.** 그리드 함수·근무타입 판정은 각각 유닛 테스트를 통과하고 그 사이에서 값이 죽으므로 **실화면/E2E에서만 드러난다.** 현장 타입 추가 시 고칠 곳 넷: 레지스트리 / `serviceability-resolver` / `generate-time-slots.policy` / **이 화이트리스트**.
   - 🔴🔴 **같은 사고가 하루에 세 번 났다 — 원인은 전부 '병렬 목록'이다 (2026-08-26).** ①위 화이트리스트 ②셔플 파견조 제외가 `!== 'BANYAN_TREE'` **부정형**이라 새 현장이 그냥 통과(파견자끼리 맞교환 가능) ③패키지 지급·취소 맵이 반얀 2종뿐이라 새 현장 상품을 **팔 수도 취소할 수도** 없었다. ⟹ 새 목록을 만들기 전에 **정본을 참조할 수 없는지** 먼저 보고(예: 취소 회차수는 `EntitlementPackageDefinition.instanceCount`, 키 목록은 `ENTITLEMENT_PACKAGE_KEYS`), 어쩔 수 없으면 **긍정형**(`=== 'DEFAULT'`)으로 쓴다. 부정형은 새 값을 조용히 통과시킨다.
