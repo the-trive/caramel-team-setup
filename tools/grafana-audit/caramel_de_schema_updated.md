@@ -379,6 +379,8 @@ END AS car_type
 | left_times | Int | NO | - | 잔여 횟수 |
 | expires_at | DateTime | YES | - | 만료일 |
 
+🔴 **사실상 죽은 테이블 — prod 전체 9행이다 (2026-09-14 확인).** 이름만 보고 "구독 월 횟수"를 여기서 읽으면 ACTIVE 구독 1,818건 중 8건만 잡힌다. 구독 횟수의 정본은 `product.name` 파싱이다(`QUERY_REFERENCE.md` §5c).
+
 ---
 
 ## Reservation: 예약

@@ -13,6 +13,7 @@ caramel-prod DB 분석 쿼리 시 반드시 따를 규칙. `grafana-audit/CLAUDE
 - **유령예약 제거** — CONFIRMED 포함 예약 집계 시 `user_service` + `car` 존재 여부 확인 → §2b
 - **디테일러 화면과 고객 화면의 예약이 다르다** — 후불 예약이 고객 앱에서만 숨겨짐(둘 다 실재) → §2b-1
 - **차량/타겟(고가차) 분석** — `reservation`엔 car_id 없음. **`reservation_car` 경유**가 정본 → §2d (⚠️ `user_service.applicable_car_id`는 ~60% NULL 함정). 타겟 판별 = `car_model_target.is_target` → §2d
+- **푸시/알림 도달 대상 = `user_device`** — `app_user`엔 토큰 컬럼이 없다. 고객당 여러 행이라 `GROUP BY user_id`로 접고 `deleted_at IS NULL`을 걸 것 → §6j
 - **행 나열 + 합계 함께 제시 시 합계는 SQL로** — 합계·상태별 건수를 답변에서 손으로 세지 말고 `GROUP BY status` 별도 쿼리로 산출해 행 수와 일치하는지 확인 (실사례: 39행 받아놓고 답변에서 35건으로 오기)
 - **dev에서 검증할 때 prod의 `service.id`를 그대로 쓰지 말 것** (2026-08-06 실측) — dev와 prod는 `service.id`가 다르다: prod `137`=`프리미엄 세차 패키지 올클린 케어`인데 **dev `137`=`[B2B] 외부만`**이고, prod `120`(반얀)·`140`(자스민)·`142`는 **dev에 없다**. 이 문서의 id는 **전부 prod 기준**이므로 dev 쿼리·dev E2E 테스트는 `service.name LIKE`로 id를 먼저 되찾아 쓴다. ⚠️틀려도 에러가 안 나고 0건이 나와서 "기능 미동작"으로 오판하게 된다
 
@@ -26,6 +27,8 @@ caramel-prod DB 분석 쿼리 시 반드시 따를 규칙. `grafana-audit/CLAUDE
 app_user (고객. NOT user/users — 그 테이블명 없음)
     │
     ├── user_address (주소/좌표. r.latitude deprecated → COALESCE 필수 → §2e)
+    │
+    ├── user_device (푸시 토큰. 고객당 여러 행·soft delete=deleted_at → §6j)
     │
     └── subscription (구독. status=ACTIVE 필터 → §5d)
 
@@ -719,6 +722,9 @@ GROUP BY d.id HAVING sub IS NULL;
 - **세차 후 응대 = `wash_result.post_wash_guidance_method`, NULL이면 `crm_type` 폴백**(옛 행). **세차 전 응대 = `wash_result.pre_wash_guidance_method` — 2026-09-10부터 계측**이라 그 전 행은 전부 NULL이다. 미기록은 값으로 두고 감추지 마라. 둘 다 `FACE_TO_FACE_EXPLAIN`→대면으로 정규화(§6d).
 - **세그먼트 축**: 신규 = 같은 `user_id`의 앞선 완료(`WASHED`·`REPORT_SENT`) 예약 없음(**고객 기준** — 기존 고객의 새 차는 신규가 아니다. 9/10 목업 실측은 차 기준이었으니 그 숫자와 비교할 땐 주의). 구독 = `subscription.deleted_yn=0 AND status='ACTIVE'` 보유(조회 시점). 범위 = §3e origin 스냅샷 `$.serviceGroupId`. 세 축은 한 번에 하나만 걸어라 — 동시에 걸면 칸마다 한두 건이라 아무것도 안 보인다.
 - ⚠️ 타임라인 행은 시각 앵커가 있어야 놓인다(전날 전화 `called_at`, 세차 전 `reservation_status_log status='IN_PROGRESS'`, 세차 후 `reservation.washed_at`). 앵커가 NULL이면 값은 있어도 행이 없다 — 목록 값과 타임라인 행 수가 다르면 먼저 이걸 의심하라.
+- 🔴 **케어 "전환"의 정본은 후속 회차 예약이지 `careProposalOutcome`이 아니다 (2026-09-13 확정).** 전환 = 그 고객에게 `concierge_care` marker `$.trialRound` 2·3인 예약이 있는 것. `wash_completion_communication_context`의 `careProposalOutcome='PROPOSED_ACCEPTED'`(제안 수락함)는 **디테일러가 앱에서 고른 값**이라 예약이 안 잡힌 건도 수락으로 남는다 — 이쪽을 전환으로 쓰면 숫자가 부푼다. 9/8~9/11 실측 전환 21건은 **전부 세차 당일~D+2**에 잡혔고 D+3 이후는 0건이라, 코호트는 이틀만 지나면 확정으로 봐도 된다.
+- 🔴 **`reservation_metadata`에 `JSON_EXTRACT`를 쓰면 `key` 필터보다 먼저 평가돼 쿼리가 죽는다 (2026-09-14 실측).** 이 테이블은 key마다 value 포맷이 다르고 **JSON이 아닌 행이 4.8만 장**이다(`__platform__` 30,577 · `timeSlotRequestId` 17,877 · `partner` 269 …). `JOIN ... ON m.key='concierge_care' ... WHERE JSON_EXTRACT(m.value,'$.trialRound')=1`처럼 써도 MySQL이 세미조인으로 접으면서 key 필터 전에 함수를 돌려 `Invalid JSON text ... at position 0`으로 끝난다 — 단순 JOIN에서는 통과하다가 `EXISTS`·CTE를 끼우는 순간 터지므로 원인이 안 보인다. ⟹ **marker JSON을 읽을 땐 항상 `JSON_EXTRACT(IF(JSON_VALID(m.value), m.value, '{}'), '$.…')`로 감싼다.** `WHERE NOT JSON_VALID(value)`로 `key='concierge_care'`만 세면 0장이라 "내 key는 멀쩡한데?"로 오해하기 쉽다 — 죽는 건 내 key가 아니라 옵티마이저가 먼저 훑은 남의 key다.
+- **어드민 `전환` 화면(`/admin/concierge-care/insights`)과 숫자를 맞추려면 넷을 그대로 따라야 한다**: ①날짜 축은 marker `$.serviceDate`가 아니라 **`reservation_datetime`의 KST 날짜**(모니터링 목록과 같은 축, 재예약 건이 갈린다 — 9/8이 serviceDate 16 vs reservation_datetime 13) ②`status NOT IN ('CANCELED','CANCELLED')` ③**고객·세차일 단위로 중복 제거**(한 고객이 하루 여러 건이면 1건 — 9/7 교육용 일괄 지정 오염이 이걸로 접힌다. `admin/bulk-free-reservation` 공존 판정보다 간단하다) ④분모는 **1회차(`$.trialRound` 없음 또는 1)만** — 2·3회차를 분모에 넣으면 전환된 고객만큼 전환율이 희석된다.
 
 ## 4. 검증 기준 (Invariant)
 
@@ -1033,6 +1039,12 @@ GROUP BY에 날짜 쓸 때 반드시 KST 변환 후 사용.
 - 🔴 **그래서 `NOW()`를 상대 기간 필터에 쓰면 항상 9시간 어긋난다 (2026-09-06 실측).** 세션 tz가 `Asia/Seoul`이라 `NOW()`·`CURDATE()`는 **KST**를 돌려주는데(`SELECT DATE_FORMAT(NOW(),'%H:%i')` = 벽시계 그대로), 비교 대상인 `reservation_datetime`·`created_at`·`washed_at`은 `datetime` 타입 **UTC 저장**이다. `WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 MONTH)` 같은 식은 창을 9시간 밀어 놓는다 — 건수가 그럴듯하게 나와서 눈에 안 띈다. ⟹ **UTC 컬럼과 비교할 땐 `UTC_TIMESTAMP()`를 쓰고, `NOW()`는 KST 저장 컬럼(`modified_at`·`paused_at`·`ended_at`)에만 쓴다.**
 - ⚠️ **이 오기가 실제로 사고를 냈다 (2026-08-06):** 티켓 러너 세션이 이 문장을 믿고 정상적인 티켓 본문(`10:38 KST`)을 `01:38 KST`로 "정정"했다. 같은 날 다른 세션은 SENS 응답의 KST `requestTime`과 19,606행 대조로 UTC임을 독립 확인했다.
 - (구 서술: "MySQL `DEFAULT CURRENT_TIMESTAMP`=서버 KST라 `created_at`/`modified_at`은 KST 벽시계, 2026-07-12 실측" — 최소 2026-05 이후 데이터에선 성립하지 않는다. `modified_at`은 **KST 저장으로 재확인됐다**(2026-09-04: 대량 재배정 행의 `modified_at + 9h`가 `22:26`으로 나왔는데 조회 시각이 `15:02`였다 — 미래값이 나오면 그 컬럼은 이미 KST다. 실제 시각은 13:26). ⟹ `reservation.modified_at`에 `+9h`·`CONVERT_TZ`를 걸지 말 것.)
+- 🔴 **UTC냐 KST냐는 테이블·컬럼이 아니라 "그 행을 누가 썼나"가 가른다 — 같은 컬럼에 두 종류가 섞여 있다 (2026-09-13 실측).** 위 목록처럼 `modified_at`·`paused_at`을 "KST 컬럼"으로 외우면 `config`·`job`에서 틀린다.
+  - **앱(Prisma)이 쓴 행 = UTC.** Prisma가 `@default(now())`로 UTC 값을 실어 보낸다. **사람이 SQL로 INSERT한 행 = KST** — 값을 안 실으면 MySQL이 컬럼 DEFAULT `CURRENT_TIMESTAMP`를 서버 tz(`@@global.time_zone`=`Asia/Seoul`)로 채운다. §2i가 쓰기 쪽 주의로 적어 둔 바로 그 현상인데, **이미 그렇게 박힌 행이 prod에 남아 있어 읽을 때도 걸린다.**
+  - **스키마로는 못 가른다.** `config`·`job_execution`·`message`·`reservation` 전부 Prisma `@default(now())` + DDL `DEFAULT CURRENT_TIMESTAMP`로 **선언이 동일**하다. 그런데 `job_execution.created_at`은 `UTC_TIMESTAMP()`를 추종(UTC)하고, 손으로 넣은 `config` 행은 KST다.
+  - 🔴 **특히 `config`(기능 플래그)와 `job`(크론 등록) — 운영자가 손으로 넣는 테이블이라 KST 행이 많다.** 하필 장애 타임라인에서 "언제 켰나"를 묻는 테이블이다. 실사례: `chat_fallback_ladder.mode`의 `modified_at` 원값 `23:25:29`에 `CONVERT_TZ`를 걸면 **다음날 08:25**가 되어 9시간 밀린 보고가 된다. `job`은 53행 중 49행이 원값 10~23시대 = KST 업무시간대로, 대부분 손INSERT다.
+  - **판정 순서.** ①`CAST(col AS CHAR)`로 원값을 본다(아래 렌더링 함정). ②`UTC_TIMESTAMP()`보다 미래면 그 행은 KST다(기존 §5a 휴리스틱). ③ 애매하면 **그 행이 자기 시각을 값으로도 갖고 있는지** 찾는다 — `chat_fallback_ladder.since` 값이 `2026-09-13T10:48:51Z`인데 같은 행 `created_at` 원값이 `19:48:53`이었다(정확히 +9h, 2초 차). 같은 사건의 두 인코딩이라 추론이 아니라 증명이다.
+  - ⚠️ **Grafana `/api/ds/query`(mysql DS)도 DATETIME을 재해석해 돌려준다** — 원값을 보려면 `CAST(col AS CHAR)`. 안 쓰면 "현재보다 8시간 미래" 같은 값이 나와 해석이 통째로 막힌다(mysql-query.sh의 `DATE_FORMAT` 함정과 같은 부류).
 - **디테일러 재배정 역추적 시그니처**: 재배정 전용 이력 테이블/로그 type은 없다. `modified_at`의 **정각 분대 = 셔플 크론이 detailer_id 변경**, 그 직후 분대(예 :51) = 사람이 어드민에서 재배정했을 개연성 (2026-07-13 임세혁 셔플 진단 실사례). 🔴 **크론 시각은 2026-07-30부로 17시 → KST 14시**(PR #515) — 지문은 `HOUR(modified_at)=14 AND MINUTE(modified_at)=0`이고, 그 이전 날짜를 조사할 때만 17시를 쓴다. `modified_at`은 **KST 저장**이라 `+9h` 하지 말 것.
   - 🔴 **단 "change_log엔 아예 안 남는다"는 반쪽 진술이다 — 두 경로를 함께 봐야 한다 (2026-07-27 예약 #79702 실측 교정).**
     - **고객이 날짜를 바꾸면서 디테일러도 바뀐 경우는 남는다**: `RESERVATION_DATETIME_CHANGED` row의 `data` JSON에 `fromDetailerId`/`toDetailerId`가 같이 실린다(#79702: 고객이 7/27→7/28 변경하며 78 이승제→88 강지성). **재배정 전용 `data.type`이 없어서 datetime 로그 안에 숨어 있다** — `data.type`으로 재배정을 찾으면 못 찾는다. `WHERE JSON_EXTRACT(data,'$.toDetailerId') IS NOT NULL`로 잡을 것.
@@ -1184,10 +1196,12 @@ JOIN entitlement_package_instance epi ON epi.id = epit.package_instance_id
 **1회권 vs 구독 구분:**
 - **구독 세차**: `user_service.subscription_id IS NOT NULL`
 - **비구독**: `user_service.subscription_id IS NULL`
+- 🔴 **"이 예약이 무슨 세차권으로 나갔나"를 볼 땐 `paid_yn`/`used_yn`을 걸지 마라 (2026-09-14 실측).** §7의 **보유** 판정 필터(`paid_yn=1 AND used_yn=0 …`)를 소진 쪽에 그대로 옮기는 실수다. 예약에 붙은 구독 세차권 중 **`used_yn=0`이 167장**(후불 18 포함)·**`paid_yn=0`이 6장**이라, 걸면 그만큼이 세차권 없는 건으로 바뀌어 비구독/1회권 칸으로 넘어간다. **`reservation_id`가 붙어 있다는 것 자체가 소진의 증거**이므로 `deleted_at IS NULL AND deleted_yn=0`만 걸 것. (예약↔세차권은 1:1 — 컨시어지 지정 예약 175건 전부 1장.)
 - 🔴 **이 NULL 칸을 "1회권"이라고 부르면 틀린다 (2026-08-20 실측).** 5·10회 횟수권 소진분·제휴 커스텀 상품·`product_id`가 NULL인 지급분이 전부 같은 칸에 들어온다. 공동구역 타겟 완료세차(2026-04-01~08-18) 비구독 621건의 내역 = 1회권 성격 352(`외부 + 내부` 202·`외부만` 150) + `5회/10회 이용권` 89 + `product_id` NULL 167 + 제휴·커스텀 13. **"1회권 N건"으로 보고하면 상품명 기준 실제 1회권보다 1.8배 부풀려진다.** 최소한 `us.product_id → product.name`까지 까고, 진짜 세그먼트가 필요하면 §5c-2의 4단 판정을 쓸 것.
 - 🔴 **구독 상품은 `product_id`로 고르면 안 된다 — 같은 이름이 여러 id로 흩어져 있다 (2026-09-09 실측).** ACTIVE 구독 기준 `월 2회(외부만)`는 product **3555~3561 7개**, `월 4회(외부만)`는 **3563~3567 5개**에 나뉘어 있다(가격대·발급시기별). id 하나로 뽑으면 그 상품의 3분의 1만 잡힌다.
   - 매칭은 **이름 부분일치**로: `p.name LIKE '%월 2회(외부만)%'`. **앞을 고정하지 말 것** — `[카라멜] 월 2회(외부만) AMG GT` 같은 개별 결제링크 상품이 `LIKE '월 2회%'`에서 빠진다.
   - 세차권 3종(1회권)은 반대로 이름 매칭이 금지고 `car_tier_product.type`이 정본이다(§7 세차권). **1회권은 type, 구독은 이름** — 규칙이 반대라는 걸 헷갈리지 말 것.
+  - 🔴 **월 몇 회짜리인지도 `product.name`에서 읽는 수밖에 없다 — 횟수 컬럼이 없다 (2026-09-14 실측).** `subscription_service.total_times`가 그 자리처럼 보이지만 **prod 전체 9행**이라 ACTIVE 구독 1,818건 중 8건만 걸린다. `product`에도 횟수 컬럼이 없고 `unit_price`는 `월 1회`가 NULL이라 `price/unit_price`도 못 쓴다. ⟹ 이름에서 `월 N회`를 파싱하되 **`월` 앞을 고정하라**(`(?:^|[^가-힣\d])월\s*(\d+)\s*회`) — 앵커가 없으면 `3개월 1회`가 `월 1회`로 접힌다. `두 달 1회`(19건)·`세차 12개월 + 정밀점검 1회`는 월 횟수가 아니니 기타로 뺄 것.
   - 실사고: 같은 모수를 "구독/1회권/신규 3종"으로 집계한 기존 산출물이 월 468건이었는데, 비구독을 통째로 세면 508건이 된다. 구독·신규 칸은 ±3건으로 재현되고 **차이 40건이 전부 이 칸에서 나왔다.** 3종 합계를 인용할 때는 "무엇이 3종 밖으로 빠졌나"를 같이 확인할 것.
 
 **구독 첫 세차 식별** (user_id + subscription_id 기준):
@@ -1791,6 +1805,9 @@ BEFORE/AFTER 섹션 종류:
 🔴 **한 사람의 세차가 여러 `user_id`·여러 `car.id`로 갈린다 — user_id로 세도 car_id로 세도 과소 카운트다 (2026-08-27 실측).** `01047046662`: 실고객 계정 2개(`7263` 본계정 / `102709` 이름이 전화 뒷자리 `6662`, 2025-08 가입)에 카니발 `214오3008`도 car 행 2개(`76147`@7263 / `73300`@102709). 실제 완료 세차는 4회인데 car 76147 기준 1회·계정 7263 기준 3회로 화면마다 달라 CS 문의가 났다(2025-08 첫 세차가 옛 계정에 있어 양쪽 다 안 보임).
 - ⟹ **고객 1명 이력 조회는 `phone`으로 계정을 먼저 모으고**(`REPLACE(phone,'-','')='...'`), 차량은 `car.id`가 아니라 `plate_number`로 묶는다.
 - ⚠️ 이런 중복 계정은 `test_yn`/`temp_yn`으로 안 걸러진다(둘 다 정상 고객 계정). 반대로 이름이 전화 뒷자리·자모인 계정을 §5b 지문 필터로 테스트로 지우기 전에 **세차 이력이 있는지 먼저 볼 것** — 실고객일 수 있다.
+- 🔴 **phone 으로 모으는 것만으로는 부족하다 — 번호가 한 자리 다른 중복 계정이 실재한다 (2026-09-13 실측).** 박대수: `227783`(`01053528786`)과 `227786`(`0105352878`, 끝자리 누락)이 8분 간격으로 생성되고 같은 차 `212호2030`이 양쪽에 1대씩 등록됐다. 예약·세차권은 전부 `227783`에만 있어 `227786`을 연 사람에겐 "예약이 없는 고객"으로 보인다. ⟹ **동일인 판정은 phone 과 `plate_number` 를 둘 다 훑을 것**(`SELECT u.id,u.name,u.phone FROM car c JOIN app_user u ON u.id=c.user_id WHERE c.plate_number='...' AND c.deleted_yn=0 AND u.deleted_yn=0`). 번호판 중복 등록은 어느 경로에서도 막지 않는다.
+- **왜 중복이 생기나**: 어드민 현장접수의 중복 판정은 phone **정확일치**이고, "완전한 번호"인지 보는 정규식이 `^01\d{8,9}$`(zero-api `isFullAdminUserPhoneSearchQuery`)라 **10자리 오타 번호도 완전번호로 취급**해 그대로 신규 생성으로 빠진다.
+- **"CS는 안 보인다는데 나는 보인다"의 1순위 원인이 이거다**: 어드민 고객 검색은 `ORDER BY u.id DESC`라 중복 중 **가장 최근(대개 비어 있는) 계정이 맨 위**에 온다. 이름·번호판 4자리로 찾으면 빈 계정을, 전체 번호로 찾으면 진짜 계정을 열게 되어 사람마다 다른 화면을 본다.
 
 **`reservation.key_direct_handover_yn`**
 - "세차 당일 다른 사람이 키를 전달할거예요" 체크박스. TinyInt: 1=대리 전달, 0=본인 직접, null=미설정(구버전).
@@ -1895,6 +1912,7 @@ CRM·트랜잭션 메시지 발송 기록 테이블.
   - ⟹ **"제외 로직을 넣었는데 왜 계속 나가나"는 여기서 갈린다.** zero 코드만 읽고 "제외됨"으로 판정하지 말 것.
   - 🔑 **이미 나간 건은 `message` 행 하나로 발신 주체가 갈린다 — charts 레포 없이 사후 판정 가능 (2026-09-07 실측).** `JSON_EXTRACT(message,'$.result.messageId')` 가 있으면 **zero-api**(신형), `JSON_EXTRACT(message,'$.response.data.msgid')` 가 있으면 **레거시 caramel-api**. 한 날짜를 `GROUP BY type` + 두 포맷 카운트로 찍으면 어느 알림이 어느 서비스에서 나갔는지 한 장에 보인다. 실사례: 9/7 `parkingInfo001` 157건 = 전부 구형(레거시), 같은 날 나머지 알림톡 13건 = 전부 신형(zero).
   - 발송한 크론 역추적 = `message.job_execution_id` → `job_execution.job_id` → `job.name`. 대상 필터를 확인할 코드를 어느 레포에서 열지는 위 포맷 판정으로 정한다.
+- ⚠️ **`job`·`config`의 `created_at`/`modified_at`에 `CONVERT_TZ`를 반사적으로 걸지 마라.** 운영자가 손으로 INSERT한 행은 이미 KST다 — "이 크론 언제 등록했나"·"이 플래그 언제 켰나"가 9시간 밀린다. 판정 순서는 §5a.
 - 🔴 **`job.status='ACTIVE'`는 "돌고 있다"의 근거가 아니다 (2026-08-25 실측).** 테이블명은 **`job`**(`cron_job` 아님). 살아 있는지 판정하려면 두 가지를 같이 봐라: ① `job_execution`의 최종 실행 시각(`MAX(created_at)`), ② 그 job 이름의 핸들러가 코드에 실존하는지(zero-api `cron-internal.controller.ts`의 `@Post('/<jobName>')`). 실사례 — `sendRainRetouchAvailablePush`는 status `ACTIVE`인데 컨트롤러에 엔드포인트가 없고 2026-05-26에 5회 돌고 멈춰 있었다(리터치 알림이 통째로 안 나감), `sendRainPolicyUpdatedNotifications`는 61일 연속 매일 돌다 2026-07-19에 정지.
 
 ### 6i. 고객↔디테일러 인앱 채팅 읽음 판정 (`chat_room`·`chat_participant`·`chat_message`) (2026-09-08 실측)
@@ -1920,6 +1938,26 @@ CRM·트랜잭션 메시지 발송 기록 테이블.
 - 시각 필터는 `created_at` **UTC 저장** — "오늘(KST)"은 `created_at >= '<어제> 15:00:00'`처럼 UTC 경계로 주고, `DATE(created_at)=CURDATE()`는 쓰지 말 것(§5a).
 - 🔴 **예약에서 방으로 가는 조인이 없다 — `chat_room`엔 `reservation_id`도 `user_id`도 없다** (컬럼 = `id`·`name`·`created_at`·`modified_at`·`deleted_at`, 2026-09-09 실측). 컨시어지 케어 지정 건은 marker JSON이 유일한 경로다: `reservation_metadata` `key='concierge_care'` → `$.notification.roomId` = 그 지정의 안내 채팅방(`$.notification.messageIds` = 인사 채팅 `chat_message.id` 배열, `$.notification.status='SENT'`가 발송 완료). 지정 건이 아니면 `chat_participant`에서 `participant_type='USER'` + `participant_id=app_user.id`로 역추적할 수밖에 없다.
 - ⚠️ **`chat_message.created_at`은 초 단위(`DateTime(0)`)다 — 밀리초 타임스탬프와 `>=`로 비교하면 같은 초 메시지가 통째로 빠진다.** marker `$.markedAt`(`...T06:30:13.376Z`) 이후 채팅만 세면, 지정 직전에 나간 인사 채팅이 같은 초(`06:30:13`)에 찍혀 사라진다(2026-09-09 실측: 오늘 대상 17건 중 9건이 이렇게 메시지를 잃고 2건은 대화가 통째로 0건이 됐다). 초로 절삭한 하한을 쓸 것. 같은 초 안의 순서는 `id` 오름차순이 정본이다.
+
+### 6j. 푸시 도달 가능 여부 (`user_device`) (2026-09-14 실측)
+
+**"알림을 보낼 수 있는 고객인가"의 정본은 `user_device.notification_token`이다.** `app_user`엔 토큰 컬럼이 없고 §1 테이블 맵에도 `user_device`가 없어서 앱 코드부터 뒤지게 된다. 컬럼 = `user_id`·`platform`(`IOS`/`ANDROID`)·`notification_token`·`device_unique_id`·`app_version`·`os_version`·`airbridge_device_uuid`·`created_at`·`modified_at`·`deleted_at`.
+
+- 🔴 **soft delete가 `deleted_at`(datetime)이고, 한 고객이 기기를 여러 대 갖는다.** `deleted_yn`으로 쓰면 `Unknown column`, 그냥 JOIN하면 고객이 기기 수만큼 중복된다. **반드시 `GROUP BY user_id`로 접은 뒤 조인할 것**:
+  ```sql
+  SELECT user_id,
+    SUM(deleted_at IS NULL) AS live_row,
+    SUM(deleted_at IS NULL AND notification_token IS NOT NULL) AS live_token
+  FROM user_device GROUP BY user_id
+  ```
+- 🔴 **"토큰 없음"을 한 덩어리로 세면 원인이 안 보인다. 세 갈래로 쪼개라.** ①`user_device` 행 자체가 없음 = **앱에서 로그인한 적 없음**(웹·전화 예약 고객) ②살아있는 행이 없음(전부 `deleted_at`) ③행은 있는데 `notification_token IS NULL` = **앱은 쓰는데 권한이 없거나 등록이 실패**. 최근 30일 예약 고객 실측: 전체 2,935명 중 토큰 없음 1,059명이고 그 안에서 ③이 766명(72%)·①이 263명(25%)·②가 30명. ①과 ③은 대책이 완전히 다르다(①=알림톡, ③=권한 UI).
+- 🔴 **`modified_at`은 "마지막 앱 사용 시각"이 아니다.** 로그인 시 기기 등록(`POST /v1/me/devices`)과 토큰 갱신(`PATCH .../{deviceUniqueId}`) 때만 갱신된다. 앱이 포그라운드로 올 때마다 도는 상태 조회는 토큰이 그대로면 DB를 안 건드린다. ⟹ **"최근 접속"으로 읽지 말고 "마지막 로그인/토큰 갱신"으로 읽을 것.**
+- ⚠️ **`modified_at`으로 `GROUP BY` 한 주차별 토큰 보유율은 코호트 추세가 아니라 스냅샷 스미어다.** 기기마다 마지막 시점에 한 번만 등장하므로, 옛 주차에 남은 기기는 "그 주 이후 한 번도 안 돌아온 기기"만 골라 본 것이다. 추세선으로 읽으면 과거가 실제보다 나빠 보인다. 시점 비교가 필요하면 `created_at` 코호트로 잡을 것.
+- ⚠️ **`PATCH /v1/me/devices/{deviceUniqueId}`는 행이 없으면 404다(upsert 아님).** 토큰 갱신 경로는 `register`를 부르지 않으므로, 행이 없거나 soft delete된 기기는 앱을 아무리 켜도 토큰이 안 붙는다. "앱 켜는데 왜 토큰이 없나"를 볼 때 ②갈래를 먼저 의심할 것.
+- **권한을 왜 못 받았는지(거부 / 아직 안 물어봄 / 등록 실패)는 DB에 없다 — Amplitude가 정본이다.** 프로젝트 `608017`, 이벤트 `View/ReservationCompletionPushPermissionBottomSheet`가 `permissionStatus`(`denied`/`undetermined`/`granted`)와 `registrationStatus`(`permission-denied`/`idle`/`error`/`registered`)를 **둘 다** 달고 나간다. 30일 실측 588명 = 거부 388(66%)·미질문 151(26%)·허용 49(8%). ⟹ 거부가 3분의 2라 "조회를 더 자주 하면 된다"는 대책은 대부분 헛돈다.
+- ⚠️ **Amplitude의 `platform` user property는 전부 `Web`이다**(고객앱이 웹뷰라서). iOS/Android를 가르려면 Amplitude 말고 `user_device.platform`을 쓸 것.
+- **코호트 정의**: 사내에서 말하는 "최근 30일 예약 고객"은 `reservation_datetime >= NOW() - INTERVAL 30 DAY` + **미래 예약 포함** + `deleted_yn=0`이다(2,935명). `created_at` 기준으로 잡으면 2,444명, 미래 예약을 빼면 2,611명으로 **전부 다른 숫자**가 나온다.
+- 테스터 제외(§0 체크리스트)를 적용하면 2,895명 / 토큰 없음 1,022명으로 **1.4%만 움직이고 비중·결론은 그대로다.** 다만 ②갈래는 30→4로 줄어든다(그 30명 대부분이 테스터·temp 계정). 숫자를 남에게 줄 때는 제외 여부를 명시할 것.
 
 
 ---
