@@ -997,9 +997,12 @@ WHERE us.reservation_id IS NULL OR r.id IS NULL
 - 완료 시점·버킷·순번(ROW_NUMBER)은 **`COALESCE(washed_at, reservation_datetime)`** 로 잡는다. `washed_at IS NOT NULL` 필터를 걸면 완료건 8.8%가 분모에서 사라지고, 첫 세차가 결측인 유저는 2번째 세차가 rn=1로 잡혀 재구매가 신규로 오분류된다(첫세차완료 −23% 실측).
 - 같은 이유로 "8월 세차완료수"가 SQL마다 3,563(reservation_datetime) vs 3,256(washed_at)으로 갈렸다. CBR 보드는 2026-09-11부터 전부 COALESCE.
 
-### 4b-19. 🔴 광고비 테이블은 채널별 적재 상한(MAX(date))을 먼저 확인하라 — `meta_daily_performance`는 2026-07-06에 멈췄다 (2026-09-10 실측)
-`meta_daily_performance` 마지막 행 2026-07-06(KST). 그런데 Meta utm 유입 가입은 8월에도 주 20~29명 → 광고 중단이 아니라 **적재 중단**(쓰는 GAS가 마케터 개인 계정, `marketing-gas-live`에는 이 테이블을 쓰는 함수가 없다). 3채널 합산 광고비·CAC 전부가 7월부터 −37% 과소, "효율 개선" 착시.
-- 채널 시작일도 다르다: `naver_daily_performance` 2026-03-17~, `google_daily_performance` 2026-04-30~. 그 전 월간 광고비는 Meta 단독값.
+### 4b-19. 🔴 광고비 테이블은 적재 상한(MAX(date))과 **값 자체**를 둘 다 의심하라 — 최신 날짜가 차 있어도 그날 값이 틀릴 수 있다 (2026-09-14 실측)
+- **적재 상한**: `meta_daily_performance`는 2026-07-06~09-10 적재가 끊겨 있었다(쓰던 GAS가 마케터 개인 계정). 2026-09-11 `marketing-gas-live/SyncMetaSpend.js`(`syncMetaSpendToDB`)가 추가돼 **현재는 다시 적재된다** — "7월에 멈췄다"는 이제 과거 상태다.
+- 채널 시작일이 다르다: `naver_daily_performance` 2026-03-17~, `google_daily_performance` 2026-04-30~. 그 전 월간 광고비는 Meta 단독값.
+- 🔴 **`meta_daily_performance`·`naver_daily_performance`는 광고 API 원본이 아니라 마케팅 대시보드 시트(`RawData`/`Naver_RawData`) 일합계다.** 시트 결손이 DB로 그대로 전파되므로 **MAX(date)가 최신이어도 값이 과소일 수 있다**. Meta 수집은 "최근 7일 행 삭제 → API 재조회" 순서라 재조회가 중단되면 그 구간이 통째로 사라진다(2026-09-14 실측: 9/8~9/13 Meta 0원, MTD −168만·소진율 34.9%로 표시, 실제 43.0%).
+- **값 대조 정본 = 광고 플랫폼 API 직접 호출.** Meta는 `graph.facebook.com/v21.0/<act_id>/insights` (토큰·계정ID는 대시보드 `Settings` 시트).
+- **누락 채널 판별법**: 리포트/시트 광고비와 DB 3채널 합의 **차이가 특정 채널의 그날 값과 일치**하면 그 채널이 빠진 것이다(1원 단위로 맞는다).
 - 광고비 합산 전 `SELECT MAX(date) FROM <각 채널 테이블>` 3줄을 먼저 친다.
 
 ### 4b-20. `detailer_supply_sheet.status` 실값 = 퇴사·현직·하차·삭제·파견·타부서 — '교육중'은 없다 (2026-09-10 실측)
