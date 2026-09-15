@@ -333,6 +333,13 @@ HAVING COUNT(DISTINCT ua.user_id) >= 5   -- 오탈자성 1~2건 단지 제거
   - `RAIN_RETOUCH`: 비 오는 날 재세차 자동 배정
   - `MANUAL_EVENT_IMPORT`: 관리자 수동 입력
 - ⚠️ `reserved_with_date` 컬럼은 레거시 — 능동/자동 구분에 사용 불가. 실제 분포: 0=~12500건, 1=98건뿐.
+- 🔴 **어드민 예약이 어느 화면에서 잡혔는지는 `reservation_metadata.key`가 경로 문자열이다 (2026-09-15 실측).** `admin/call`(콜 콘솔) · `admin/walk-in`(반얀 현장접수) · `admin/bulk-free-reservation`(일괄 무료). 콜·워크인 건은 `source_type`이 **NULL**이라 source_type으로는 못 가른다(일괄 무료만 `ADMIN_BULK_FREE`). value JSON = `$.sales.partnerId`(잡은 계정) · `$.pricingMode`(`TARGET_FREE` 타겟 무료 / `BANYAN_FREE` / `USER_SERVICE` 보유 세차권 / `ADMIN_FREE` 운영자 무료 / **NULL = 정가 후불**). JSON 읽을 땐 §3g의 `JSON_VALID` 가드.
+  - `admin/walk-in` value의 `$.washPass` = `ISSUED`(현장이 무료 1회권을 새로 발급) / `OWNED`(고객 보유 세차권 소진). 2026-09-12(zero #2303)부터 찍히고 그 전 행은 필드가 없다 = 전부 ISSUED. 보드 취소가 세차권을 삭제할지 돌려줄지 이 값으로 가른다.
+  - 🔴 **패키지 세차권(`entitlement_package_item`)으로 잡힌 예약은 옵션권이 같이 붙었는지 따로 봐야 한다 (2026-09-15 실측).** 현장접수 OWNED 경로가 필수 옵션권을 안 붙이던 버그가 있었다(zero #2366에서 수정). 점검 조인 = `user_service.reservation_id=r.id` → `entitlement_package_item(item_type='SERVICE', status='ACTIVE')` → 같은 `package_instance_id`의 `item_type='OPTION'` 행 → `user_option.reservation_id`가 NULL이거나 `used_yn=0`이면 미소진. 미소진분은 `POST /v1/admin/users/{u}/reservations/{r}/option-tickets {userOptionId}`로 붙이면 사용 처리와 `estimated_time` 재계산까지 된다.
+    - ⚠️ **`LEFT JOIN user_option ... HAVING COUNT(*)=0`으로 "옵션 안 붙은 예약"을 세면 오탐이다.** service 137에는 패키지로 발급된 것과 그냥 발급된 것이 섞여 있어, 애초에 묶음 옵션권이 없는 세차권까지 걸린다(2026-09-15 실측 10건 중 3건). 판정은 반드시 `entitlement_package_instance`까지 조인하고 `status='ACTIVE' AND deleted_at IS NULL`을 걸 것.
+    - `POST .../option-tickets`는 **`WASHED` 예약에도 통한다**(201). 상태 가드가 없고 완료 예약은 겹침 검사 대상이 아니라, 지난 세차의 소급 차감에 그대로 쓴다. `estimated_time`은 재계산되지만 과거 예약이라 일정에 영향이 없다.
+    - 🔴 **#2366으로 다 고쳐진 게 아니다.** `confirmAdminReservationWithinTx`를 쓰는 **콜 콘솔 '보유 세차권 사용'과 레거시 `POST /v1/admin/users/{id}/reservations`는 여전히 묶음을 안 붙인다**(예약 97902는 9/12 생성 = #2283 배포 이후인데 옵션 2장 미소진). 세 경로를 한 번에 닫는 수정은 zero #2380 — 머지 전까지는 이 경로로 잡힌 예약을 계속 감사할 것.
+  - **디테일러가 잡은 예약 = `$.sales.partnerId` → `partner.detailer_id IS NOT NULL`**로 판정한다. `$.sales.detailerId`는 예약 당시 스냅샷이라 partner 현재값과 81/428만 일치 — 쓰지 마라. ⚠️ **`partner 41 오퍼레이터`는 detailer_id=8(내부 테스트)이 걸려 있지만 CS 공유 계정**이다. 디테일러 영업 집계에서 `p.id<>41`로 제외.
 
 ### 2h. "중복 예약" 신고 진단 — 신고된 날짜/시각으로 좁혀 검색하지 말 것
 
@@ -1179,6 +1186,8 @@ JOIN entitlement_package_instance epi ON epi.id = epit.package_instance_id
 
 "첫 세차 vs n번째"는 유저별 선행 `WASHED`/`REPORT_SENT` 카운트로 — 하한 없이(§4b-1).
 
+- **세차권이 어디서 발급됐는지 = `user_service.partner_activity_log_id` → `partner_activity_log` (2026-09-15 실측).** `action='SERVICE_ISSUED'`(옵션은 `OPTION_ISSUED`, 포인트는 `POINT_ISSUED`), `description`에 행사명·사유가 온다("더현대", "반얀트리" …). `payment_id IS NULL AND paid_yn=1`이면 어드민 발급이다. 오프라인 행사 세차권 집계는 `description`으로 잡는다 — `app_user.utm_source='offline'`은 가입 경로일 뿐 어느 행사인지 안 나온다.
+
 ### 5d. 구독 status=ACTIVE 필터
 
 - `status='ACTIVE'` 단독 조건은 일시정지 포함 → "현재 세차 가능한 활성 구독자" 집계 시 왜곡
@@ -1901,6 +1910,8 @@ CRM·트랜잭션 메시지 발송 기록 테이블.
   - **당일 07:00 `parkingInfo001`(주차위치 안내)에도 디테일러 이름·연락처·차량번호가 들어간다** — 통지 노출 시점은 D-1 18:00과 D-day 07:00 **두 번**이다.
 - 🔴 **`message.message`의 `request` JSON은 구/신 2종이 혼재한다 — `request.msg`로만 뽑으면 신규분이 통째로 NULL이다 (2026-08-06 실측).** 구=`{msg, phn, tmplId, title, …}`(알림톡 레거시 경로) / 신=`{content, recipient, channel, metadata, trackingKey, …}`. 최근 30일 기준 `tmplId` NULL이 32,366건으로 **최대 그룹**인데 이건 "템플릿 없음"이 아니라 **신규 스키마라 그 키가 없는 것**이다. 본문·템플릿 조회는 `COALESCE(JSON_UNQUOTE(JSON_EXTRACT(message,'$.request.msg')), JSON_UNQUOTE(JSON_EXTRACT(message,'$.request.content')))` 처럼 **양쪽을 함께** 볼 것. 수신번호도 `request.phn`(구) vs `request.recipient`(신)로 갈린다.
   - **판별 키 = `$.request.channel` (2026-08-10 전수 실측).** `KAKAO`(6,803건)·`MMS`(961)·`PUSH`(4)는 **`content` 100% / `msg` 0건**, `channel` NULL(5,553)만 `msg` 위주(3,549). 즉 알림톡·MMS는 `msg`로 뽑으면 **무조건 NULL**이다. ⟹ **body NULL을 "발송 안 됨"으로 읽지 말 것** — 발송 여부는 row 존재와 `created_at`으로 판정한다.
+- 🔑 **PUSH 행의 수신 기기 역추적은 `user_device_id`가 아니라 감사 JSON의 토큰으로 한다 (2026-09-15 실측).** `lms_type='PUSH'` 행에서 `user_device_id`는 고객 푸시 38%·디테일러 푸시 0%만 채워진다(디테일러는 `detailer_device`라 FK 자체가 없다). 대신 zero-api 경로는 `JSON_UNQUOTE(JSON_EXTRACT(message,'$.request.recipient.pushToken'))`이 `status='OK'` 행 100%에 있다(`send-signal.handler`가 resolved recipient를 머지한 `dispatchRequest`를 감사에 넘긴다). 고객/디테일러 구분 = `detailer_id IS NOT NULL`. `message_id` = Expo 티켓 id(영수증 조회 키). `reference_number`는 전화번호가 없을 때 토큰이 들어간다.
+- ⚠️ **`message`에 시간 인덱스가 없다** — 인덱스는 PK·`type`·`job_execution_id`·`customer_id`·`user_device_id`·`tracking_key`뿐. `created_at`/`request_at` 범위 조회는 80만 행 풀스캔(prod ~1초). 짧은 창을 반복 조회할 때 `id`나 `type`을 함께 걸 수 있으면 건다.
 - **CRM 7일 예약전환 측정**: received(테스터 제외 live_users §5b) → 발송 후 7일 내 `reservation` 생성(`r.user_id = m.customer_id`, `r.created_at` 기준, `r.deleted_yn=0`. raw·비인과). `(customer_id, type)`별 첫 발송 dedup. 상세·재현쿼리 = caramel-api `docs/superpowers/specs/2026-06-30-crm-kill-keep-map.md` §2/§6.
 - **세차 시작 되돌리기(cancel-start) 이벤트 지문 = `reservation_status_log`에서 같은 예약의 `IN_PROGRESS` 뒤에 오는 `CONFIRMED`** (2026-08-10). 전용 로그 테이블은 없다. 한 예약에 여러 번 찍힐 수 있다(시작→되돌림→재시작→되돌림).
   ```sql
@@ -1950,6 +1961,7 @@ CRM·트랜잭션 메시지 발송 기록 테이블.
   -- 읽음 = cp.last_read_message_id >= m.id
   ```
   ⚠️ NULL을 "추적 미구현"으로 읽지 말 것 — 같은 시점 82명 중 26명은 값이 찍혀 있다(2026-09-08). 기능은 돈다.
+- 🔴 **이 판정은 "지금 읽었나"만 답한다 — 과거 어느 날의 읽음률은 복원되지 않는다 (2026-09-15).** `last_read_message_id`·`last_read_at`은 방·참가자당 **한 행을 계속 덮어쓴다.** 그래서 9월 초 메시지도 고객이 어제 방을 한 번 열었으면 전부 "읽음"으로 찍히고, "그날 그 시점에 읽었나"는 DB 어디에도 남지 않는다(Amplitude에도 채팅방 열람 이벤트가 없다). **기간을 갈라 before/after를 비교하는 데 이 컬럼을 쓰면 after가 부풀고 before가 과대평가된다.** 기간 비교가 필요하면 `chat_message` 타임스탬프로 복원 가능한 **"셀장 메시지 뒤 N시간 내 고객 답장"**을 대체 지표로 쓴다. 읽은 *시각* 자체는 `chat_read_log`(2026-09-15 추가, 배포 이후 구간만 적재)로만 남는다.
 - 🔴 **`visibility='STAFF_ONLY'`는 고객에게 안 보이는 내부 메모다 — 읽음률 분모에서 빼라.** `content_type='INTERNAL_MEMO'`와 짝. 이걸 안 빼면 **"고객이 안 읽은 메시지"로 오분류**된다(실사례 2026-09-08: 셀장 채팅 읽음 집계에서 김정수 건이 "6건 중 5건 읽음"으로 나왔는데, 안 읽힌 1건이 STAFF_ONLY 내부 메모였고 고객에게 보인 5건은 전부 읽음이었다). 고객 관점 집계엔 항상 `m.visibility='ALL' AND m.deleted_at IS NULL`.
 - `content_type` = `TEXT`·`IMAGE_GALLERY`·`CATALOG_CARE_PROGRAM`·`CATALOG_CONDITION_RESET_PROGRAM`·`INTERNAL_MEMO`. 본문은 `content` JSON이라 텍스트 검색은 `chat_message_content`를 조인해야 한다.
 - ⚠️ **한 방에 디테일러가 2명 들어간 방이 있다**(실측 room 80·81·82). "방의 DETAILER = 담당자"로 가정하지 말고 **발신자(`sender_participant_id`) 기준**으로 셀 것.
@@ -1970,9 +1982,17 @@ CRM·트랜잭션 메시지 발송 기록 테이블.
   FROM user_device GROUP BY user_id
   ```
 - 🔴 **"토큰 없음"을 한 덩어리로 세면 원인이 안 보인다. 세 갈래로 쪼개라.** ①`user_device` 행 자체가 없음 = **앱에서 로그인한 적 없음**(웹·전화 예약 고객) ②살아있는 행이 없음(전부 `deleted_at`) ③행은 있는데 `notification_token IS NULL` = **앱은 쓰는데 권한이 없거나 등록이 실패**. 최근 30일 예약 고객 실측: 전체 2,935명 중 토큰 없음 1,059명이고 그 안에서 ③이 766명(72%)·①이 263명(25%)·②가 30명. ①과 ③은 대책이 완전히 다르다(①=알림톡, ③=권한 UI).
-- 🔴 **`modified_at`은 "마지막 앱 사용 시각"이 아니다.** 로그인 시 기기 등록(`POST /v1/me/devices`)과 토큰 갱신(`PATCH .../{deviceUniqueId}`) 때만 갱신된다. 앱이 포그라운드로 올 때마다 도는 상태 조회는 토큰이 그대로면 DB를 안 건드린다. ⟹ **"최근 접속"으로 읽지 말고 "마지막 로그인/토큰 갱신"으로 읽을 것.**
+- 🔑 **`modified_at`은 24시간 하트비트다 — 권한이 켜져 있는지를 간접으로 읽는 유일한 자리다 (2026-09-15 정정).** 앱은 토큰이 그대로여도 마지막 등록from 24시간이 지났으면 `PATCH`를 다시 보낸다(`PUSH_REGISTRATION_HEARTBEAT_INTERVAL_MS = 24h`). 그 재전송은 **권한이 켜져 있을 때만** 일어나고, 권한이 꺼진 걸 앱이 발견하면 반대로 토큰을 `NULL`로 만든다. ⟹ 다음처럼 읽는다:
+  - `notification_token` 있음 + `modified_at` 최근 = **그 시각에 권한이 켜져 있었다**
+  - `notification_token` NULL + `modified_at` 최근 = 권한이 꺼진 것을 앱이 확인했다
+  - `modified_at`이 오래됨 = 그 뒤로 앱을 안 열었다. **지금 상태는 모른다**
+  - 실측(2026-09-15): 최근 30일 예약 고객 중 토큰 보유 1,942명의 92%가 30일 이내 갱신, 19%(374명)는 하루 이내.
+  - ⚠️ 2026-09-14에 이 줄을 "로그인·토큰 갱신 때만 갱신된다"고 적었는데 **틀렸다.** 하트비트를 못 보고 `modified_at`을 "마지막 로그인"으로 읽으면 앱 사용 여부를 과소평가한다.
 - ⚠️ **`modified_at`으로 `GROUP BY` 한 주차별 토큰 보유율은 코호트 추세가 아니라 스냅샷 스미어다.** 기기마다 마지막 시점에 한 번만 등장하므로, 옛 주차에 남은 기기는 "그 주 이후 한 번도 안 돌아온 기기"만 골라 본 것이다. 추세선으로 읽으면 과거가 실제보다 나빠 보인다. 시점 비교가 필요하면 `created_at` 코호트로 잡을 것.
 - ⚠️ **`PATCH /v1/me/devices/{deviceUniqueId}`는 행이 없으면 404다(upsert 아님).** 토큰 갱신 경로는 `register`를 부르지 않으므로, 행이 없거나 soft delete된 기기는 앱을 아무리 켜도 토큰이 안 붙는다. "앱 켜는데 왜 토큰이 없나"를 볼 때 ②갈래를 먼저 의심할 것.
+- 🆕 **`user_device.notification_permission`이 추가된다 (zero PR #2361, 2026-09-15 develop 대상).** 값 = `granted`/`denied`/`undetermined`/`provisional`/`ephemeral`/`unavailable`/NULL. 앱이 로그인 후 기기 등록(POST)과 토큰 PATCH에 얹어 보낸다. ⚠️ 앱 쪽은 다음 스토어 빌드부터 채워지고, 구 앱 행은 NULL로 남는다 — NULL을 "미질문"으로 읽지 말 것. prod에 컬럼이 실제로 있는지는 `information_schema`로 먼저 확인.
+- 🆕 **`message.result_code`는 푸시에서 영수증 마커다 (zero PR #2362).** `status='OK' AND result_code='OK'` = Expo 접수만 확인, `result_code='RECEIPT_OK'` = 영수증 ok(APNs/FCM 인계), `status='DeviceNotRegistered'` 등 = 영수증 오류. 크론 `expoPushReceiptSweep`이 매시간 15분~24시간 전 접수분을 갱신하고 `DeviceNotRegistered` 토큰을 NULL로 만든다.
+- 🔴 **권한 상태를 담는 컬럼은 prod 스키마 전체에 없다 (2026-09-15 전수, 위 PR 머지 전 기준).** `information_schema`에서 `%permission%`·`%notification%`·`%push%`로 긁으면 나오는 건 `user_device.notification_token`과 `detailer_device.notification_token` 둘뿐이다. Amplitude에도 **사용자 단위 속성은 없다** — `permissionStatus`는 배너·시트가 뜬 순간의 이벤트 속성이라 "물어본 사람"만 덮는다. ⟹ 인구 전체의 권한 상태는 **못 잰다**. 위 하트비트가 유일한 대리 지표다.
 - **권한을 왜 못 받았는지(거부 / 아직 안 물어봄 / 등록 실패)는 DB에 없다 — Amplitude가 정본이다.** 프로젝트 `608017`, 이벤트 `View/ReservationCompletionPushPermissionBottomSheet`가 `permissionStatus`(`denied`/`undetermined`/`granted`)와 `registrationStatus`(`permission-denied`/`idle`/`error`/`registered`)를 **둘 다** 달고 나간다. 30일 실측 588명 = 거부 388(66%)·미질문 151(26%)·허용 49(8%). ⟹ 거부가 3분의 2라 "조회를 더 자주 하면 된다"는 대책은 대부분 헛돈다.
 - ⚠️ **Amplitude의 `platform` user property는 전부 `Web`이다**(고객앱이 웹뷰라서). iOS/Android를 가르려면 Amplitude 말고 `user_device.platform`을 쓸 것.
 - **코호트 정의**: 사내에서 말하는 "최근 30일 예약 고객"은 `reservation_datetime >= NOW() - INTERVAL 30 DAY` + **미래 예약 포함** + `deleted_yn=0`이다(2,935명). `created_at` 기준으로 잡으면 2,444명, 미래 예약을 빼면 2,611명으로 **전부 다른 숫자**가 나온다.
