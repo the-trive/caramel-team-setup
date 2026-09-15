@@ -650,6 +650,8 @@ GROUP BY s.detailer_id, d.name ORDER BY min_km;
 
 🔴 **케어 회차 축은 `reservation_metadata key='concierge_care'`의 JSON `$.trialRound`다 (2026-09-11 실측).** 어드민 후속 예약(2·3회차)은 `$.source='ADMIN_FOLLOWUP'`이 붙고, 셀장이 기존 예약에 지정한 1회차는 `source` 없음·`trialRound`가 비어 있으면 1로 읽는다. 후속 예약은 처음부터 service 145로 **생성**되므로 `concierge_care_origin_service` 스냅샷이 없다 — "스냅샷 우선, 없으면 service 폴백" 규칙에 따라 전부 외부+내부로 읽히는 게 맞다.
 
+⚠️ **`$.trialRound`는 도중에 들어온 필드다 — 초기 마커 106건엔 키 자체가 없다 (2026-09-15 실측).** prod 분포 = 없음 106(9월 첫 주 생성) · `'1'` 59 · `'2'` 28 · `'3'` 21(2·3은 `$.source='ADMIN_FOLLOWUP'` 동반). `WHERE … $.trialRound = '1'`로 걸면 첫 주가 통째로 빠진다. 1회차 판정은 항상 **키 없음 OR `'1'`**.
+
 🔴 **`reservation.estimated_time` 저장값 ≠ 어드민·API가 보여주는 소요분일 수 있다.** 일정·슬롯 조회(`hydrateReservationsWithDurationEstimate` 경로)는 읽을 때마다 산식+floor로 **재산출**하지만, CS 운영 상세(`GET /v1/admin/reservations/{id}/operations`)와 겹침 재확인·이어서 생성은 **저장값**을 그대로 쓴다. 저장값은 생성·옵션 변경·marker 정리 때만 갱신된다. 정책이 바뀌면 둘이 갈린다(실사례: 2·3회차 120분 배포 직후 미래 34건이 저장 140·화면 120). 겹침 재확인·이어서 생성 같은 일부 서버 경로는 저장값을 읽으니, "화면과 다르다"는 문의는 두 값을 나눠 봐라.
 
 🔴 **케어 지정은 예약의 세차권 서비스를 `컨시어지 케어 체험`(service 145, `service_group_id=1` = 외부+내부)으로 갈아치운다. 원래 상품은 `user_service`에 남지 않는다 (2026-09-08 실측).** 모니터링을 위한 의도된 교체다. 그래서 케어 예약에 `JOIN service`로 세차 범위를 읽으면 **전부 외부+내부로 나온다** — prod 18건 중 12건이 원래 외부만인데 그렇게 보인다. 원래 상품의 정본은 `reservation_change_log`의 `JSON_EXTRACT(data,'$.type') = 'CONCIERGE_CARE_SERVICE_CLASSIFICATION_CHANGED'` → `$.fromServiceId`(전 기간 커버, 예약별 첫 로그가 원본)다. "케어 예약의 세차 범위 비중"을 물으면 `service`가 아니라 이걸 봐라. ✅ **2026-09-08부터 `reservation_metadata` `key='concierge_care_origin_service'`(JSON `serviceId`·`serviceGroupId`·`serviceName`·`timeRequired`)가 정본이다** — prod 배포 + 기존 18건 소급 생성 완료(change log와 1:1 대조). 세차 범위는 이 스냅샷 `$.serviceGroupId`(1=외부+내부·3=외부만)를 먼저 읽고, 없으면 `user_service→service.service_group_id`로 폴백. 해제돼도 스냅샷은 안 지우므로 `concierge_care` marker `deleted_at IS NULL`과 함께 걸어야 "지금 케어인 건"이 된다.
@@ -725,6 +727,9 @@ GROUP BY d.id HAVING sub IS NULL;
 - 🔴 **케어 "전환"의 정본은 후속 회차 예약이지 `careProposalOutcome`이 아니다 (2026-09-13 확정).** 전환 = 그 고객에게 `concierge_care` marker `$.trialRound` 2·3인 예약이 있는 것. `wash_completion_communication_context`의 `careProposalOutcome='PROPOSED_ACCEPTED'`(제안 수락함)는 **디테일러가 앱에서 고른 값**이라 예약이 안 잡힌 건도 수락으로 남는다 — 이쪽을 전환으로 쓰면 숫자가 부푼다. 9/8~9/11 실측 전환 21건은 **전부 세차 당일~D+2**에 잡혔고 D+3 이후는 0건이라, 코호트는 이틀만 지나면 확정으로 봐도 된다.
 - 🔴 **`reservation_metadata`에 `JSON_EXTRACT`를 쓰면 `key` 필터보다 먼저 평가돼 쿼리가 죽는다 (2026-09-14 실측).** 이 테이블은 key마다 value 포맷이 다르고 **JSON이 아닌 행이 4.8만 장**이다(`__platform__` 30,577 · `timeSlotRequestId` 17,877 · `partner` 269 …). `JOIN ... ON m.key='concierge_care' ... WHERE JSON_EXTRACT(m.value,'$.trialRound')=1`처럼 써도 MySQL이 세미조인으로 접으면서 key 필터 전에 함수를 돌려 `Invalid JSON text ... at position 0`으로 끝난다 — 단순 JOIN에서는 통과하다가 `EXISTS`·CTE를 끼우는 순간 터지므로 원인이 안 보인다. ⟹ **marker JSON을 읽을 땐 항상 `JSON_EXTRACT(IF(JSON_VALID(m.value), m.value, '{}'), '$.…')`로 감싼다.** `WHERE NOT JSON_VALID(value)`로 `key='concierge_care'`만 세면 0장이라 "내 key는 멀쩡한데?"로 오해하기 쉽다 — 죽는 건 내 key가 아니라 옵티마이저가 먼저 훑은 남의 key다.
 - **어드민 `전환` 화면(`/admin/concierge-care/insights`)과 숫자를 맞추려면 넷을 그대로 따라야 한다**: ①날짜 축은 marker `$.serviceDate`가 아니라 **`reservation_datetime`의 KST 날짜**(모니터링 목록과 같은 축, 재예약 건이 갈린다 — 9/8이 serviceDate 16 vs reservation_datetime 13) ②`status NOT IN ('CANCELED','CANCELLED')` ③**고객·세차일 단위로 중복 제거**(한 고객이 하루 여러 건이면 1건 — 9/7 교육용 일괄 지정 오염이 이걸로 접힌다. `admin/bulk-free-reservation` 공존 판정보다 간단하다) ④분모는 **1회차(`$.trialRound` 없음 또는 1)만** — 2·3회차를 분모에 넣으면 전환된 고객만큼 전환율이 희석된다.
+- 🔴 **줄 단위 원자료는 SQL로 재구성하지 말고 어드민 API를 불러라 (2026-09-15 실측).** `GET /v1/admin/concierge-care/targets?reservationDate=YYYY-MM-DD`(날짜별 1회)가 대상 1건씩 `path`(전날 전화·세차 전/후) · `conditions`(신규·구독·범위) · `flow.followup`(전환) · `leaderName` · `careProposalLabel` · `progressKind`를 그대로 준다. 날짜를 훑어 모은 뒤 **(세차일, 고객)으로 중복 제거**하면 `GET /v1/admin/concierge-care/insights?from&to`와 정확히 일치한다(9/7~9/14 실측 64지정·27전환). 바로 위 넷을 SQL로 다시 구현하면 드리프트 위험만 진다 — marker JSON은 교차분석 축이 더 필요할 때만 붙여라. 토큰 = gamma 어드민 로그인 후 `localStorage['@caramel/admin-auth'].state.accessToken`.
+- 🔴 **케어 채팅 "읽음"의 정본은 `chat_participant.last_read_message_id`다 (2026-09-14 실측, 코드 `chat-run.ts`와 같은 판정).** 방은 marker `$.notification.roomId` 하나만 보고(추측해서 다른 방을 붙이지 마라), 참가자 행은 `participant_type='USER' AND participant_id=고객 user_id AND left_at IS NULL`. 읽음 모수가 될 메시지는 **marker `$.markedAt` 이후 · `deleted_at IS NULL` · `visibility <> 'STAFF_ONLY'`(내부 메모 제외) · 발신자가 고객이 아닌 것**이고, 포인터가 그 마지막 id 이상이면 끝까지 읽은 것이다. ⚠️ **세 가지를 갈라 써라** — 참가자 행이 없으면 *모름*, 행은 있는데 `last_read_message_id`가 NULL이면 *0 = 전혀 안 읽음*, 보낸 메시지가 0건이면 *판정 불가*. 셋을 뭉치면 "안 읽음"이 부푼다(9/7~9/13 케어 55건 중 모름 4·안 읽음 17).
+- ⚠️ **고객·세차일 중복 제거에서 대표를 시각만으로 고르면 화면과 2~3건이 어긋난다.** 교육용 일괄 지정 등으로 `reservation_datetime`이 같은 쌍둥이 예약이 있고, 한쪽에만 `wash_result`·통화 기록이 붙는다. 시각 → **기록 있는 건 우선** 순으로 정렬해 대표를 잡아야 어드민 전환 화면의 접점 표와 줄 단위로 일치한다(총계는 어느 쪽이든 같아서 안 틀킨다).
 
 ## 4. 검증 기준 (Invariant)
 
@@ -1032,6 +1037,16 @@ WHERE us.reservation_id IS NULL OR r.id IS NULL
 
 DB는 UTC 저장 → `CONVERT_TZ(col, '+00:00', '+09:00')` 또는 `+ INTERVAL 9 HOUR`
 
+- 🔴 **`mysql-query.sh`의 JSON 출력은 datetime을 9시간 당겨 찍는다 — 끝의 `Z`를 믿으면 시각을 9시간 틀린다 (2026-09-15 실측).** DB 세션이 `Asia/Seoul`이라 직렬화기가 **저장값을 KST로 해석해 UTC로 바꿔** 출력한다. 즉 **화면의 `...Z` + 9h = 실제 저장값(UTC), + 18h = KST.**
+  ```
+  json_출력            2026-09-13T00:00:06.000Z   ← 이걸 UTC로 읽으면 틀림
+  실제 저장값(UTC)      2026-09-13 09:00
+  실제 KST             2026-09-13 18:00          ← 정답(D-1 알림톡 18시와 일치)
+  ```
+  ⚠️ `+ INTERVAL 9 HOUR`를 걸어도 **결과가 datetime이면 출력 단계에서 다시 9시간 당겨진다** — 변환한 보람이 사라진다. **시각을 눈으로 볼 때는 항상 `DATE_FORMAT(...,'%Y-%m-%d %H:%i')`로 문자열로 뽑을 것**(문자열은 변환 안 됨). `TIMESTAMPDIFF` 같은 계산은 SQL 안에서 원값끼리 하므로 영향 없다.
+  - 실사례: 채팅 폴백 알림톡 발송 시각을 JSON 그대로 읽어 "새벽 1시 31분 발송"으로 오판할 뻔했다. 실제는 **10:31 KST**였다. 조용시간(quiet hours) 위반으로 오진하기 딱 좋은 함정.
+  - `WHERE` 절 경계값은 영향 없다 — 문자열 리터럴로 주면 저장값(UTC)과 그대로 비교된다. "어제(KST)" = `created_at >= '<어제-1> 15:00:00' AND < '<어제> 15:00:00'`.
+
 GROUP BY에 날짜 쓸 때 반드시 KST 변환 후 사용.
 
 예외: `paused_at`, `ended_at`은 코드에서 KST(`Asia/Seoul`)로 할당 → UTC +9H 변환 불필요.
@@ -1066,6 +1081,7 @@ GROUP BY에 날짜 쓸 때 반드시 KST 변환 후 사용.
 - **절대경로로 부르면 죽는다** — `~/.caramel-team-setup/mysql-query.sh "..."`는 `Cannot find module 'mysql2/promise'`로 실패한다(`node_modules`가 그 디렉터리에 있고 스크립트가 cwd 기준으로 require). **`cd ~/.caramel-team-setup && ./mysql-query.sh "..."`로 부를 것.** 스킬·문서에 절대경로로 적힌 곳이 있으니 그대로 믿지 말 것.
 - **prod는 `sql_mode=only_full_group_by`다** — `GROUP BY`에 없는 컬럼을 그냥 SELECT하면 쿼리가 통째로 거부된다(에러만 나고 결과 0). JOIN해온 부가 컬럼(`ss.status`·`ss.region` 등)은 `MAX(...)`로 감싸거나 GROUP BY에 넣을 것.
 - SQL이 `--`로 시작하면 옵션으로 파싱돼 실패한다 → 맨 앞에 공백 한 칸.
+- **`WITH`로 시작하는 쿼리는 본문에 `REPLACE(`가 있으면 가드가 차단한다** (2026-09-14). 가드는 `SELECT`로 시작하면 통과시키고 CTE만 쓰기 키워드(`INSERT|UPDATE|DELETE|REPLACE|CREATE|…`)로 단어 검사하는데, MySQL 문자열 함수 `REPLACE()`가 쓰기 `REPLACE`와 같은 낱말이라 읽기 쿼리가 "읽기 쿼리만 허용합니다"로 거부된다. ⟹ CTE 안에서는 `REPLACE` 대신 `SUBSTRING_INDEX`·`STR_TO_DATE`·`TRANSLATE`류로 우회하거나, 그 부분만 `SELECT` 시작 쿼리로 분리해라. (ISO 문자열 파싱은 `STR_TO_DATE(x,'%Y-%m-%dT%H:%i:%s.%fZ')`로 충분하다.)
 - **dev DB도 같은 커넥션에서 읽는다 — 테이블 앞에 `` `caramel-dev`. `` 를 붙인다** (2026-09-08 실측): `` SELECT ... FROM `caramel-dev`.partner ``. 스크립트 헤더가 "기본 대상은 prod"라고만 적어 dev는 못 본다고 오해하기 쉽다. 쓰기는 가드가 막으니 SELECT 전용으로만 쓸 것(prefix 빠뜨린 DDL이 prod에 만들어진 사고가 이 경고의 출처다).
 
 **⚠️ DATE 컬럼(시각 없음)도 렌더링 함정 — 하루 밀림**
