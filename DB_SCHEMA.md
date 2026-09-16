@@ -694,8 +694,32 @@ END AS sub_type
 | paid_yn | TinyInt | NO | 0 | 결제 여부 |
 | deleted_yn | Boolean | NO | false | 삭제 여부 |
 | postpaid_yn | Boolean | NO | false | 후불 여부 |
+| applicable_car_id | Int | YES | - | 사용 가능 차량 제한. NULL=모든 차량, 값=그 차량 전용. `user_service_applicability` 행이 있으면 그쪽 `config`가 우선(prisma @deprecated) |
+| deleted_at | DateTime | YES | - | 삭제 시각 |
+| delete_reason | Text | YES | - | 삭제 사유 (실값은 QUERY_REFERENCE user_service 표) |
+| paid_amount | Int | YES | - | 결제 금액 |
+| coupon_campaign_reward_id | Int | YES | - | FK → coupon_campaign_reward |
 
-**인덱스:** `(user_id, deleted_yn, paid_yn, used_yn, ended_at)`, `(user_id, deleted_yn, paid_yn, used_yn, postpaid_yn, ended_at)`
+**인덱스:** `(user_id, deleted_yn, paid_yn, used_yn, ended_at)`, `(user_id, deleted_yn, paid_yn, used_yn, postpaid_yn, ended_at)`, `(user_id, applicable_car_id, deleted_yn, paid_yn, used_yn, ended_at)`
+
+---
+
+### user_service_applicability
+
+세차권 1장의 사용 가능 차량 조건 스냅샷. 예약 생성 시 서버가 이 `config`(없으면 `user_service.applicable_car_id`, 둘 다 없으면 모든 차량)로 차량 적합성을 판정한다.
+
+| 컬럼 | 타입 | nullable | 기본값 | 설명 |
+|------|------|-----|--------|------|
+| id | Int | NO | autoincrement | PK |
+| created_at | DateTime | NO | now() | 생성일 |
+| modified_at | DateTime | NO | now() | 수정일 |
+| user_service_id | Int | NO | - | FK → user_service (unique, 1:1) |
+| definition_id | Int | YES | - | FK → entitlement_applicability_rule_definition |
+| source_type | VarChar(50) | YES | - | PRODUCT_SERVICE / COUPON_CAMPAIGN_REWARD / COUPON_CODE_REWARD |
+| source_id | Int | YES | - | source_type 별 원본 id |
+| config | Json | NO | - | 필터 목록 `{filters:[{key,matchType,value}]}` (예: CAR_ID EQUALS, 차량 티어). 빈 목록=모든 차량 |
+
+**인덱스:** `definition_id`, `(source_type, source_id)`
 
 ---
 
