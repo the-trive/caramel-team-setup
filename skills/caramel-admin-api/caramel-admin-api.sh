@@ -42,9 +42,58 @@ METHOD=$(echo "$1" | tr '[:lower:]' '[:upper:]')
 API_PATH="$2"
 BODY="${3:-}"
 
-# ── 쓰기 경고 ─────────────────────────────────────────────────────
-if [[ "$METHOD" != "GET" && "$METHOD" != "HEAD" ]]; then
-  echo "[WRITE] $METHOD $API_PATH" >&2
+# ── 3층 게이트 ────────────────────────────────────────────────────
+# read      조회
+# reversible 되돌릴 수 있는 고객 데이터(세차권·포인트·주소·차량·예약 취소)
+# outbound   실제 슬롯을 점유하거나 고객·돈이 바깥으로 나가는 것
+TEST_ACCOUNTS_FILE="$SCRIPT_DIR/.test-accounts"
+AUDIT_LOG="$SCRIPT_DIR/.audit.log"
+
+_tier() {
+  if [[ "$METHOD" == "GET" || "$METHOD" == "HEAD" ]]; then echo read; return; fi
+  case "$API_PATH" in
+    */reservations|*/concierge-reservation|*/reservation-create-candidates/confirm) echo outbound; return ;;
+    */payments/*/refund) echo outbound; return ;;
+    */detailer-swap*|*/datetime-change*|*/address-change) echo outbound; return ;;
+  esac
+  # PATCH /v1/admin/users/{u}/reservations/{r} = 재배정·시각 변경
+  if [[ "$METHOD" == "PATCH" && "$API_PATH" =~ /reservations/[0-9]+$ ]]; then echo outbound; return; fi
+  echo reversible
+}
+
+_target_user_id() {
+  [[ "$API_PATH" =~ /users/([0-9]+) ]] && echo "${BASH_REMATCH[1]}"
+}
+
+TIER=$(_tier)
+TARGET_USER=$(_target_user_id || true)
+
+if [[ "$TIER" != "read" ]]; then
+  echo "[$TIER] $METHOD $API_PATH" >&2
+
+  if [[ "${CARAMEL_ADMIN_WRITE_APPROVED:-}" != "1" ]]; then
+    echo "ERROR: 쓰기 호출은 CARAMEL_ADMIN_WRITE_APPROVED=1 이 붙어야 실행됩니다." >&2
+    echo "  CARAMEL_ADMIN_WRITE_APPROVED=1 $(basename "$0") $METHOD $API_PATH '<body>'" >&2
+    exit 1
+  fi
+
+  if [[ "$TIER" == "outbound" ]]; then
+    is_test_account=0
+    if [[ -n "$TARGET_USER" && -f "$TEST_ACCOUNTS_FILE" ]] \
+      && grep -qx "$TARGET_USER" "$TEST_ACCOUNTS_FILE"; then
+      is_test_account=1
+    fi
+    if [[ $is_test_account -eq 0 && "${CARAMEL_ADMIN_OUTBOUND_APPROVED:-}" != "1" ]]; then
+      echo "ERROR: 이 호출은 실제 디테일러 슬롯을 점유하거나 고객·돈이 바깥으로 나갑니다." >&2
+      echo "  대상 userId=${TARGET_USER:-?} 는 $TEST_ACCOUNTS_FILE 의 테스트 계정이 아닙니다." >&2
+      echo "  실고객 대상이면 사용자에게 대상과 body를 확인받은 뒤 CARAMEL_ADMIN_OUTBOUND_APPROVED=1 을 붙이세요." >&2
+      exit 1
+    fi
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\tuser=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CARAMEL_ADMIN_BASE" "$TIER" "$METHOD" "$API_PATH" "${TARGET_USER:-}" \
+    >> "$AUDIT_LOG"
 fi
 
 # ── 토큰 캐시 (20분) ──────────────────────────────────────────────

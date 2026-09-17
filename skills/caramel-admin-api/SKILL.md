@@ -69,12 +69,48 @@ bash $HELPER POST /v1/admin/users/225046/subscriptions/789/cancel '{"cashRefundA
 | PATCH /v1/admin/users/{userId} | 기본정보 수정 `{name,phone,note,adminYn}` |
 | POST /v1/admin/users/{userId}/pretend-token | 빙의 토큰 발급 |
 
-## 안전 규칙
+## 안전 규칙 — 스크립트가 3층으로 강제한다
 
+`mysql-write.sh`와 같은 방식이다. 규칙을 문서에 적어두고 지키길 바라는 게 아니라, 스크립트가 거절한다.
+
+| 층 | 대상 | 통과 조건 |
+|---|---|---|
+| `read` | GET·HEAD | 없음 |
+| `reversible` | 세차권·옵션권·패키지·포인트·주소·차량 지급/수정, 예약 취소, 구독 | `CARAMEL_ADMIN_WRITE_APPROVED=1` |
+| `outbound` | 예약 생성(`/reservations`·`/concierge-reservation`·`create-candidates/confirm`), 재배정·시각/주소 변경, 환불 | 위 + 대상이 `.test-accounts` 의 테스트 계정, 아니면 `CARAMEL_ADMIN_OUTBOUND_APPROVED=1` |
+
+```bash
+# 되돌릴 수 있는 것
+CARAMEL_ADMIN_WRITE_APPROVED=1 bash $HELPER POST /v1/admin/users/225046/points '{"point":1000,"expiredDate":"2026-12-31","reason":"CS 보상"}'
+
+# 실고객 예약 생성 — 대상과 body를 사용자에게 확인받은 뒤에만
+CARAMEL_ADMIN_WRITE_APPROVED=1 CARAMEL_ADMIN_OUTBOUND_APPROVED=1 bash $HELPER POST /v1/admin/users/225046/reservations '{...}'
+```
+
+- `outbound`가 따로 있는 이유: 이 층만 **실제 디테일러 슬롯을 점유하고 고객에게 알림이 나간다.** 테스트 계정 대상 예약과 실고객 예약은 위험도가 다른데 명령만 보면 똑같아서, 계정 화이트리스트로 가른다.
+- **테스트 계정 목록** = `.test-accounts` (한 줄에 userId 하나). 실고객 id를 넣지 말 것 — 이 목록이 유일한 안전장치다.
+- 모든 쓰기는 `.audit.log`에 시각·환경·층·경로·대상 userId로 남는다.
 - **prod 대상**: base URL이 `api-prod.thetrive.com`이므로 모든 호출이 운영 서버에 즉시 반영됨
-- **쓰기는 사용자 승인 후**: POST/PATCH/DELETE 실행 전 대상 id·body를 사용자에게 재확인
-- **파괴적 작업 재확인**: DELETE/refund/cancel은 반드시 대상 id와 body를 한 번 더 확인 후 실행
 - **raw SQL 대신 이 API**: DB 직접 write 금지, 반드시 이 헬퍼 경유
+
+### E2E 실증 절차 (코드 수정이 실제로 먹는지 확인할 때)
+
+테스트 계정에 상품을 지급해 한 사이클 돌리고 되돌린다. 실고객 데이터를 건드리지 않는다.
+
+```bash
+H=~/.claude/skills/caramel-admin-api/caramel-admin-api.sh
+U=111175   # .test-accounts 에 있는 계정
+
+CARAMEL_ADMIN_WRITE_APPROVED=1 bash $H POST /v1/admin/users/$U/entitlement-packages '{"packageKey":"PREMIUM_WASH_PACKAGE_1"}'
+bash $H GET "/v1/admin/users/$U/reservation-create-candidates/available-slots?addressId=<addr>&carId=<car>&userServiceId=<us>&fromDate=<D>&toDate=<D+3>"
+CARAMEL_ADMIN_WRITE_APPROVED=1 bash $H POST /v1/admin/users/$U/concierge-reservation '{"addressId":...,"carId":...,"pricingMode":"USER_SERVICE","serviceGroupId":1,"productId":null,"reservations":[{"detailerId":...,"reservationDatetime":"...Z","serviceIndex":0}]}'
+# ← 여기서 DB로 확인
+CARAMEL_ADMIN_WRITE_APPROVED=1 bash $H POST /v1/admin/users/$U/reservations/bulk-cancel '{"reservationIds":[<r>],"ticketAction":"DELETE"}'
+```
+
+- `PREMIUM_WASH_PACKAGE_1` = 세차권 1 + 프왁 1 + 살균 1. 패키지 묶음 동작을 보는 가장 작은 단위다.
+- 보유 세차권은 서버가 `serviceGroupId` 안에서 **만료 임박순**으로 고른다. 테스트 계정에 다른 세차권이 있으면 방금 지급한 게 먼저 뽑히는지 `ended_at`으로 확인할 것.
+- 끝나면 `bulk-cancel`(`ticketAction=DELETE`)로 예약과 세차권·붙은 옵션권을 함께 지운 뒤, `POST /v1/admin/users/{u}/entitlement-packages/cancel '{"instanceIds":[<inst>]}'`로 패키지 인스턴스를 CANCELLED로 닫는다(2026-09-17 실측). ⚠️`GIVE_BACK`은 패키지 항목을 재발급한다(옛 item → REPLACED, 새 세차권·옵션권 생성) — 테스트 정리에 쓰면 티켓이 다시 생긴다.
 
 ## 예약 재배정 가드 (필수 — 담당 디테일러 변경 시)
 

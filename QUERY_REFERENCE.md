@@ -338,7 +338,8 @@ HAVING COUNT(DISTINCT ua.user_id) >= 5   -- 오탈자성 1~2건 단지 제거
   - 🔴 **패키지 세차권(`entitlement_package_item`)으로 잡힌 예약은 옵션권이 같이 붙었는지 따로 봐야 한다 (2026-09-15 실측).** 현장접수 OWNED 경로가 필수 옵션권을 안 붙이던 버그가 있었다(zero #2366에서 수정). 점검 조인 = `user_service.reservation_id=r.id` → `entitlement_package_item(item_type='SERVICE', status='ACTIVE')` → 같은 `package_instance_id`의 `item_type='OPTION'` 행 → `user_option.reservation_id`가 NULL이거나 `used_yn=0`이면 미소진. 미소진분은 `POST /v1/admin/users/{u}/reservations/{r}/option-tickets {userOptionId}`로 붙이면 사용 처리와 `estimated_time` 재계산까지 된다.
     - ⚠️ **`LEFT JOIN user_option ... HAVING COUNT(*)=0`으로 "옵션 안 붙은 예약"을 세면 오탐이다.** service 137에는 패키지로 발급된 것과 그냥 발급된 것이 섞여 있어, 애초에 묶음 옵션권이 없는 세차권까지 걸린다(2026-09-15 실측 10건 중 3건). 판정은 반드시 `entitlement_package_instance`까지 조인하고 `status='ACTIVE' AND deleted_at IS NULL`을 걸 것.
     - `POST .../option-tickets`는 **`WASHED` 예약에도 통한다**(201). 상태 가드가 없고 완료 예약은 겹침 검사 대상이 아니라, 지난 세차의 소급 차감에 그대로 쓴다. `estimated_time`은 재계산되지만 과거 예약이라 일정에 영향이 없다.
-    - 🔴 **#2366으로 다 고쳐진 게 아니다.** `confirmAdminReservationWithinTx`를 쓰는 **콜 콘솔 '보유 세차권 사용'과 레거시 `POST /v1/admin/users/{id}/reservations`는 여전히 묶음을 안 붙인다**(예약 97902는 9/12 생성 = #2283 배포 이후인데 옵션 2장 미소진). 세 경로를 한 번에 닫는 수정은 zero #2380 — 머지 전까지는 이 경로로 잡힌 예약을 계속 감사할 것.
+    - ✅ **콜 콘솔·레거시 어드민 경로도 zero #2380으로 닫혔다(main `381435b65`, prod 2026-09-16). 2026-09-17 콜 콘솔 경로 E2E 실증됨.** 그 전에 만들어진 예약은 여전히 옵션이 안 붙어 있으니 감사할 때 `r.status IN ('CONFIRMED','WASHED')`로 **미래 예약까지** 본다 — 9/15 감사가 WASHED만 봐서 배포 전 CONFIRMED 2건(97680·98463)을 놓쳤다.
+    - 판정 쿼리는 **옵션 종류별로** 본다 — 인스턴스의 `OPTION` 항목(`required_yn=1`)에서 `DISTINCT option_id`를 뽑고, 그 예약에 같은 `option_id`의 `user_option(deleted_yn=0)`이 `LEFT JOIN`으로 안 걸리면 그 종류가 미소진. `entitlement_package_item`은 SERVICE·OPTION 양쪽 다 `status='ACTIVE'`를 걸 것 — GIVE_BACK 취소는 세차권뿐 아니라 **패키지 항목도 재발급**한다(옛 행 `status='REPLACED'`·`replaced_by_item_id`, 새 세차권·옵션권 행 생성, 2026-09-17 실측). 테스트 계정 정리처럼 재발급을 원치 않으면 `ticketAction=DELETE` 후 `POST /v1/admin/users/{u}/entitlement-packages/cancel {instanceIds}`로 인스턴스를 CANCELLED(`deleted_at` 기록)로 닫는다.
   - **디테일러가 잡은 예약 = `$.sales.partnerId` → `partner.detailer_id IS NOT NULL`**로 판정한다. `$.sales.detailerId`는 예약 당시 스냅샷이라 partner 현재값과 81/428만 일치 — 쓰지 마라. ⚠️ **`partner 41 오퍼레이터`는 detailer_id=8(내부 테스트)이 걸려 있지만 CS 공유 계정**이다. 디테일러 영업 집계에서 `p.id<>41`로 제외.
 
 ### 2h. "중복 예약" 신고 진단 — 신고된 날짜/시각으로 좁혀 검색하지 말 것
@@ -1188,6 +1189,20 @@ JOIN entitlement_package_instance epi ON epi.id = epit.package_instance_id
 
 - **세차권이 어디서 발급됐는지 = `user_service.partner_activity_log_id` → `partner_activity_log` (2026-09-15 실측).** `action='SERVICE_ISSUED'`(옵션은 `OPTION_ISSUED`, 포인트는 `POINT_ISSUED`), `description`에 행사명·사유가 온다("더현대", "반얀트리" …). `payment_id IS NULL AND paid_yn=1`이면 어드민 발급이다. 오프라인 행사 세차권 집계는 `description`으로 잡는다 — `app_user.utm_source='offline'`은 가입 경로일 뿐 어느 행사인지 안 나온다.
 
+### 5c-3. 🔴 "이 세차 한 건에 얼마 썼나" = `user_service` + `user_option`의 `paid_amount`. `payment.reservation_id`로 조인하면 90%가 사라진다 (2026-09-17 실측)
+
+예약 1건의 실지출(세차권 + 옵션)을 묻는 질문의 정본 경로다. 객단가(§4b-15)는 월 단위 정의라 이 질문에 못 쓴다.
+
+🔴 **`payment.reservation_id`는 대부분 NULL이다.** 카트 결제(zero)가 예약에 직접 안 붙는다 — 2026-06-17~09-17 실측: 완료·확정 예약 11,195건 중 이 컬럼으로 결제가 붙는 건 **1,131건(10.1%)**, 같은 기간 PAID 결제 8,481건 중 **7,218건(85.1%)이 `reservation_id` NULL**이다. 결제→예약 조인으로 시작하면 조용히 90%를 잃는다. 연결은 항상 `user_service.reservation_id` · `user_option.reservation_id`로.
+
+- **옵션은 `user_option`**(§user_option). `user_service`만 합치면 옵션이 통째로 빠진다.
+- **`paid_amount`가 NULL이면 그 결제건의 잔액을 균등분할**한다 — `(payment.amount − cancel_amount − 형제항목의 알려진 paid_amount 합) ÷ NULL인 형제 수`. 어드민 세차권 표시가 쓰는 규칙과 같다(균등분할, `reference_admin_ticket_price_two_rules`).
+- **NULL의 정체**(위 기간, 완료·확정 예약): `user_service` 11,105행 중 6,473 NULL이고 그중 **5,108이 `type='SUBSCRIPTION'`** — 구독 세차는 금액이 안 채워진다. `user_option`은 4,044행 중 951 NULL(대부분 회권·패키지 소진분).
+
+🔴 **폴백을 `product.price`로 잡지 마라 — 회권 정가가 한 번의 세차에 통째로 붙는다.** `5회/10회 이용권`(31~64만원)의 소진 1장이 그 금액 전액으로 잡혀, "한 번에 15만원 이상" 예약이 **46건 → 223건으로 5배 부푼다**(실측). 옵션도 `options.price`(정가) 폴백은 할인·번들을 무시한다.
+
+⚠️ **균등분할 분모는 살아있는 형제만 센다 — 형제가 이미 `deleted_yn=1`이면 과대배분된다.** 실측 payment 31997(118,650원, `외부 + 내부 외 2개`)은 service 행이 지워지고 옵션 2행만 남아 각 59,325원으로 잡혔다(실제 정가 40,000·50,000). 한 항목이 그 결제의 정가 대비 과하게 크면 이걸 의심할 것.
+
 ### 5d. 구독 status=ACTIVE 필터
 
 - `status='ACTIVE'` 단독 조건은 일시정지 포함 → "현재 세차 가능한 활성 구독자" 집계 시 왜곡
@@ -1791,6 +1806,13 @@ BEFORE/AFTER 섹션 종류:
 - 🔑 **①/② 중 어느 경로로 붙는지는 코드가 결정한다 — 캠페인에 `coupon_campaign_reward`가 한 행이라도 있으면 등록 시 `coupon_code_reward`는 무시된다** (`prisma-coupon.repository.ts applyCouponCode`: `coupon_campaign.rewards` 비어 있을 때만 코드 보상 경로). 그래서 코드마다 `coupon_code_reward`(PACKAGE) 행이 붙어 있어도 실제 `user_service`는 `coupon_campaign_reward_id`로 연결된다(2026-09-12 실측 현백 5회권: campaign_reward 767건 vs code_reward 9건 — 9건 중 5건은 캠페인 보상 생성(6/25) 전, 4건은 그 뒤 6/27·7/7·7/31 등록 — 레거시 caramel-api `/careplus/coupon/apply` 경유 추정, 확인 필요. 그래서 ①도 0건은 아니니 두 경로 UNION 원칙은 그대로). 판정 = `SELECT COUNT(*) FROM coupon_campaign_reward WHERE campaign_id=? AND deleted_at IS NULL`이 0보다 크면 ② 경로만 보면 된다. 아래 jyc 6/26 전환도 이 규칙(캠페인 보상 추가 시점)이다.
 - **기존 캠페인에 코드를 추가하는 API는 없다** — caramel-api graphql `createCouponCampaign`·zero `POST /v1/admin/coupon-campaigns` 둘 다 새 캠페인을 만든다. 실발급 코드와 같은 형태의 테스트 코드는 `coupon_code` 1행(`max_usage_count=1`·`total_supply_count=1`·`campaign_id`) + `coupon_code_reward` 1행을 SQL로 넣는다(예: `HDTEST51`, 2026-09-12).
 - ⚠️ **캠페인→예약전환 조회 시 발급경로 3가지 다 확인**: 캠페인마다 세차권 연결 컬럼이 다르다 — ① `user_service.coupon_code_reward_id`(코드별 보상 경유) ② `user_service.coupon_campaign_reward_id`(캠페인 단위 보상 `coupon_campaign_reward` 경유 — 예: 자스민 캠페인 80 → reward id 86) ③ `service` 직결(코드 등록 즉시 특정 서비스 지급 — 예: "자스민 전용 무료 세차권" = `service.id=140`, `coupon_code_reward` 레코드 자체가 0건). 한 경로가 0건이라고 "예약 전환 0건"으로 단정하지 말 것 — 캠페인명으로 `service.name` 매칭 + `coupon_campaign_reward.campaign_id` 양쪽을 교차 확인.
+- 🔴 **네 번째 경로 = `reward_type='PROMOTION'`(100% 할인권). 이때 `user_service`의 쿠폰 reward 컬럼은 둘 다 NULL이라 위 3경로 전부 0건이 나온다 (2026-09-17 실측, jyc).** 제휴 무료세차가 "세차권 지급"이 아니라 **"할인 프로모션 적용"**으로 구현된 캠페인이 있다 — jyc 56·57·62·63의 `coupon_campaign_reward.reward_type`은 전부 `PROMOTION`(reward_id 128=프리미엄 왁스 무료 / 129=외부+내부 세차 무료, 둘 다 `metadata.discount.value=100`). 그래서 `user_service.coupon_code_reward_id`·`coupon_campaign_reward_id`가 **전건 NULL**이고, 세차권은 평범한 유상 세차권 모양(`service_id=20 외부+내부`)에 `payment.amount=0`·`type='VOUCHER'`로 붙는다. ⟹ **연결 고리는 `promotion_application`이다**(쿠폰 reward 컬럼이 `user_service`가 아니라 여기 붙는다):
+  `promotion_application`(`table_name='app_user'`, `record_id`=user_id, `coupon_campaign_reward_id`/`coupon_code_reward_id` → 캠페인) → **`payment_id`** → `user_service.payment_id` → `reservation.status='WASHED'`.
+  - 판정 = `SELECT reward_type FROM coupon_campaign_reward WHERE campaign_id=?`. `PROMOTION`이면 위 3경로를 쳐봐야 빈 결과다(실제로 `[]` 나옴 → "전환 0건"으로 오답).
+  - 회차 세기는 `promotion_id`로 갈라라 — 세차 1회당 129(세차)+128(왁스) **2행**이 생긴다. 무료세차 횟수는 `reservation_id` DISTINCT로 세야 2배가 안 된다.
+  - ⚠️ `promotion_application.payment_id`는 살아있는 컬럼이다. §7 `log` 표의 "`promotion_application.payment_id` 🔴 사망"은 **`log` 테이블이 그 컬럼의 변경을 안 남긴다**는 뜻이지 컬럼이 안 채워진다는 뜻이 아니다(2026-08 실측 380행 채움).
+  - ⚠️ `coupon_campaign_reward`에는 `package_name`·`package_service_id`·`package_key`가 **없다**(그건 `coupon_code_reward`만). 같은 이름의 두 보상 테이블이 컬럼이 다르다.
+  - 🔴 **같은 제휴처가 보상 타입을 갈아탄다** — jyc 후속 캠페인 **96(2026-09-10)은 `PROMOTION`이 아니라 `SERVICE`(122 올클린 케어)+`OPTION`(1 왁스)**다. 즉 jyc 하나를 추적하려면 PROMOTION 경로와 campaign_reward 경로를 **둘 다** UNION 해야 한다. 캠페인 하나 찍어보고 "이 제휴처는 이 경로"로 고정하면 새 캠페인에서 조용히 0건이 된다.
 - **`coupon_campaign_reward.group_no` = 회차 묶음** (제휴처 N회권 패키지 구조): N회권 상품은 회권별로 **별도 캠페인**으로 등록된다(예: 현대백화점 프리미엄 세차 패키지 1/3/5회권 = campaign 73/74/75, `partner_name='현대백화점'`). 각 캠페인의 reward를 `group_no`로 회차별로 묶는다 — `group_no=1~N`이 각 회차분(그룹마다 `reward_type='SERVICE'` 1개 + `OPTION` 세트 반복), `group_no=NULL`은 회차 무관 패키지 전체 1회 보너스(`PROMOTION`·추가 `OPTION` 등). 따라서 "N회권"의 실제 세차 횟수는 `COUNT(DISTINCT group_no) WHERE reward_type='SERVICE'`로 세야 정확(reward row 수로 세면 OPTION/PROMOTION 포함돼 과대). `reward_type`은 `SERVICE`/`OPTION`/`PROMOTION` 혼재.
 - 🔴 **어드민 쿠폰 발급 API로는 N회권(패키지) 캠페인을 만들 수 없다** — `POST /v1/admin/coupon-campaigns`(`prisma-admin-coupon-campaign.repository.ts`)는 리워드를 만들 때 `group_no`를 아예 넣지 않는다. 어드민으로 발급하면 리워드가 전부 `group_no=NULL`이 되어 **회차 묶음이 아니라 개별 지급**이 된다(예: 벤틀리 campaign 93은 어드민 발급이라 1회권 구조). 현백 73/74/75처럼 회차 묶음이 필요하면 SQL/스크립트로 `group_no`를 직접 채워야 한다. "어드민에서 만들면 된다"고 답하면 틀린다.
 - 🔴 **`coupon_campaign`의 `name`·`partner_name`은 라벨이 아니라 zero-api/web 코드의 상수 키다 — 이름만 바꿔도 집계·알림·앱 화면이 조용히 틀어진다.** 실제로 문자열을 키로 쓰는 곳: ① `prisma-coupon.repository.ts`의 `COUPON_PACKAGE_REDEEM_PAYMENT_AMOUNT_BY_CAMPAIGN_NAME`(캠페인명 → 합성 POINT 결제 금액. 매칭 실패 시 기본 80,000으로 떨어져 세차당 매출이 부풀려진다) ② `department-store-premium-package-campaign.policy.ts`(`partner_name==='현대백화점'` + 이름 정규식 → 등록완료 화면·세차권 상세 진입 게이트) ③ `my-wash-ticket.helpers.ts`의 partner_name → 세차권 설명 맵 ④ `partner-vip-alert.rules.ts`의 `packageKeyPatterns: ['campaign:{id}:']`(제휴 슬랙 카드 라벨). ⟹ 제휴처를 갈아끼우려고 캠페인을 새로 파거나 이름을 고칠 땐 이 4곳을 같이 봐야 한다.
@@ -1802,7 +1824,7 @@ BEFORE/AFTER 섹션 종류:
 - **전환 퍼널 = 발급≠사용**: ① `coupon_code_usage`(수령) → ② `user_service.reservation_id IS NOT NULL`(예약) → ③ `reservation.status='WASHED'`(완료). 무료 쿠폰은 ①→②에서 대량 이탈.
 - **등록된 쿠폰의 보상 종류(할인/무료세차/옵션) 집계는 두 경로 UNION**: ① `coupon_code_usage → coupon_code_reward(coupon_code_id)`(코드별 보상) ② `coupon_code_usage → coupon_code.campaign_id → coupon_campaign_reward`(캠페인별 보상). 한쪽만 조인하면 절반이 빠진다(2026-09-03 60일 실측: PROMOTION 코드별 97명 vs 캠페인별 166명, SERVICE 39 vs 109).
 - 🔴 **쿠폰 "등록자" 모수는 `coupon_code_usage`로 세라. `promotion_application` 경유는 발급경로가 바뀌면 조용히 0이 된다 (2026-08-12 실측).** `promotion_application`은 쿠폰 등록과 **같은 트랜잭션에서** 생긴다(`created_at` diff 0초 — "적용 시점에 생긴다"가 아니다). 함정은 **보상 연결 컬럼이 시점에 따라 바뀐다**는 것: jyc 캠페인은 **2026-06-26부터 `coupon_code_reward_id` → `coupon_campaign_reward_id`로 전환**됐고 7/1 이후 등록은 100% 후자다(등록월별 code_reward/campaign_reward = 3~5월 56/0 → 6월 35/16 → **7월 0/17** → 8월 2/22). `coupon_code_reward_id`만 조인한 추적기는 **7월 이후 쿠폰 등록자를 0명 잡았다**(JYC 시트 실사고). ⚠️ 옛 캠페인만 보면 격차가 거의 없어(56 = 47/50) "두 경로 비슷하다"고 오판한다 — 위 §6e "발급경로 3가지 다 확인" 경고의 재발 사례이고, `coupon_code_usage`는 경로 변경에 면역이라 모수용으로 안전하다.
-- 🔴 **제휴처 모수는 `campaign_id` 하드코딩 대신 `coupon_campaign.partner_name` 전수로 (2026-08-12 실측).** 같은 제휴처가 코드 소진 후 **동명 후속 캠페인을 새로 발행**한다: jyc = 56·57 `[jyc] 첫 세차 프리미엄 패키지`(2026-03-04) → **62·63 `..._2`(2026-05-04)**. campaign_id를 박아둔 추적기·시트는 **신규 캠페인을 조용히 통째로 놓친다** — 실사례: JYC 추적 GAS가 56·57만 봐서 _2 등록자 61명 중 **57명 누락(그중 30명은 이미 세차 완료)**, 전 기간 세차완료자가 113명으로 보였으나 실제 145명(32/145 = 22% 과소). 판정 = `JOIN coupon_campaign cpn ON cpn.id = cc.campaign_id AND cpn.partner_name = '<제휴처>'`. ⚠️ 위 현대백화점 N회권 분할(73/74/75)과는 **다른 축** — 그건 회권별 동시 분할, 이건 시간순 재발행이다.
+- 🔴 **제휴처 모수는 `campaign_id` 하드코딩 대신 `coupon_campaign.partner_name` 전수로 (2026-08-12 실측).** 같은 제휴처가 코드 소진 후 **동명 후속 캠페인을 새로 발행**한다: jyc = 56·57 `[jyc] 첫 세차 프리미엄 패키지`(2026-03-04) → **62·63 `..._2`(2026-05-04)** → **96 `[jyc] 첫 세차 프리미엄 패키지`(2026-09-10, 2026-09-17 확인)**. campaign_id를 박아둔 추적기·시트는 **신규 캠페인을 조용히 통째로 놓친다** — 실사례: JYC 추적 GAS가 56·57만 봐서 _2 등록자 61명 중 **57명 누락(그중 30명은 이미 세차 완료)**, 전 기간 세차완료자가 113명으로 보였으나 실제 145명(32/145 = 22% 과소). 판정 = `JOIN coupon_campaign cpn ON cpn.id = cc.campaign_id AND cpn.partner_name = '<제휴처>'`. ⚠️ 위 현대백화점 N회권 분할(73/74/75)과는 **다른 축** — 그건 회권별 동시 분할, 이건 시간순 재발행이다.
 - 리텐션/매출은 `user_service.paid_amount`와 `payment`(status='PAID') 양쪽으로 교차검증. 무료세차 당일 결제는 현장 옵션 업셀 — `payment.paid_at > 무료세차 washed_at`로 진짜 재방문만 분리.
 - **쉘 계정 어뷰징**: 무료 쿠폰 코호트엔 `app_user.phone IS NULL` + 랜덤 이름(`name REGEXP '^[A-Za-z0-9]{6,8}$'`) + 예약 0건인 가짜 계정이 섞임. 실사용자 모수는 **`phone IS NOT NULL`** 필터.
 
@@ -2414,6 +2436,7 @@ FROM reservation_onsite_collection roc WHERE roc.status<>'CANCELED';
 | paid_at | datetime | 결제 완료일 |
 | name | varchar(250) | 상품명 (구독은 플랜명 포함, `'외 N개'` suffix 주의) |
 | deleted_yn | tinyint(1) | NULL 가능 — `IS NOT TRUE` 패턴 사용 |
+| reservation_id | int | 🔴 **85%가 NULL**(카트 결제는 예약에 안 붙는다). 예약↔결제 연결은 `user_service`/`user_option` 경유 — §5c-3 |
 
 🔴 **`amount`는 포인트 상계 후 금액이다 — 정액 구독인데 금액이 매달 다르면 가격 변경이 아니라 포인트 차감이다 (2026-08-14 실측).**
 - 실측: 234,000원 정액 링크 구독이 `234,000 / 225,000 / 216,000 / 234,000 / 219,000 / 234,000`으로 찍혔다. 차액 9,000·18,000·15,000은 전부 그 달에 태운 포인트였다.
